@@ -328,6 +328,7 @@ fn lifecycle_initialize_once_then_status() {
 
     let st = client.status();
     assert!(!st.has_policy);
+    assert_eq!(st.policy_revision, 0);
     assert!(!st.admin_frozen);
     assert!(!st.heartbeat_expired);
     assert_eq!(st.now, 0);
@@ -343,6 +344,34 @@ fn allowed_transaction_succeeds() {
     assert!(h.emitted_allowed_auth());
     let st = h.status();
     assert!(!st.heartbeat_expired);
+}
+
+#[test]
+fn policy_revision_increments_across_set_and_revoke() {
+    let h = Harness::new();
+    let client = PolicyEngineClient::new(&h.env, &h.guard);
+
+    // 0 pre-first-set
+    let mut st = client.status();
+    assert_eq!(st.policy_revision, 0);
+
+    // 1 after set
+    h.env.mock_all_auths();
+    client.set_policy(&h.base_policy());
+    st = client.status();
+    assert_eq!(st.policy_revision, 1);
+
+    // 2 after revoke
+    h.env.mock_all_auths();
+    client.revoke_policy();
+    st = client.status();
+    assert_eq!(st.policy_revision, 2);
+
+    // 3 after second set
+    h.env.mock_all_auths();
+    client.set_policy(&h.base_policy());
+    st = client.status();
+    assert_eq!(st.policy_revision, 3);
 }
 
 #[test]

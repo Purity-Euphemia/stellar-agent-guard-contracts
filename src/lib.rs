@@ -120,6 +120,13 @@ fn save_ledger(env: &Env, ledger: &Ledger) {
     );
 }
 
+fn increment_revision(env: &Env) -> u64 {
+    let rev = persist_get::<u64>(env, &DataKey::PolicyRevision).unwrap_or(0);
+    let next = rev.saturating_add(1);
+    persist_set(env, &DataKey::PolicyRevision, &next);
+    next
+}
+
 // ── Policy config validation (SPEC §8) ───────────────────────────────────
 
 fn has_dup<T: PartialEq + TryFromVal<Env, Val> + IntoVal<Env, Val>>(
@@ -267,6 +274,7 @@ impl PolicyEngine {
         let admin = Self::admin_or_panic(&env);
         validate_config(&env, &config).unwrap_or_else(|e| panic_with_error!(&env, e));
         persist_set(&env, &DataKey::Policy, &config);
+        increment_revision(&env);
         save_ledger(&env, &Ledger::empty(&env));
         let now = env.ledger().timestamp();
         persist_set(&env, &DataKey::LastHeartbeat, &now);
@@ -278,6 +286,7 @@ impl PolicyEngine {
         let admin = Self::admin_or_panic(&env);
         env.storage().persistent().remove(&DataKey::Policy);
         env.storage().persistent().remove(&DataKey::Window);
+        increment_revision(&env);
         emit_policy_revoked(&env, &admin);
     }
 
@@ -330,6 +339,7 @@ impl PolicyEngine {
     #[allow(clippy::must_use_candidate)] // public read surface
     pub fn status(env: Env) -> Status {
         let has_policy = persist_get::<PolicyConfig>(&env, &DataKey::Policy).is_some();
+        let policy_revision = persist_get::<u64>(&env, &DataKey::PolicyRevision).unwrap_or(0);
         let admin_frozen = persist_get::<bool>(&env, &DataKey::AdminFrozen).unwrap_or(false);
         let last_heartbeat = persist_get::<u64>(&env, &DataKey::LastHeartbeat).unwrap_or(0);
         let now = env.ledger().timestamp();
@@ -337,6 +347,7 @@ impl PolicyEngine {
             persist_get::<PolicyConfig>(&env, &DataKey::Policy).map_or(0, |c| c.dms_grace_secs);
         Status {
             has_policy,
+            policy_revision,
             admin_frozen,
             heartbeat_expired: grace > 0
                 && last_heartbeat != 0

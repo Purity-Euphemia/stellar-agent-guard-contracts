@@ -336,7 +336,8 @@ impl CustomAccountInterface for PolicyEngine {
 ```rust
 #[contracttype]
 pub struct Status { pub admin_frozen: bool, pub heartbeat_expired: bool,
-                   pub last_heartbeat: u64, pub now: u64, pub has_policy: bool }
+                   pub last_heartbeat: u64, pub now: u64, pub has_policy: bool,
+                   pub policy_revision: u64 }
 
 #[contracttype]
 pub enum CheckResult { Allowed, Blocked(BlockReason) }
