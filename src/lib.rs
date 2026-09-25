@@ -309,6 +309,14 @@ impl PolicyEngine {
     pub fn heartbeat(env: Env) {
         env.current_contract_address().require_auth();
         let now = env.ledger().timestamp();
+        // Redundant same-second heartbeat: `LastHeartbeat` is already `now`, so
+        // the write (with its TTL extension) and the event carry no new
+        // information — the first heartbeat of this second already extended the
+        // entry's TTL. Skip both rather than pay for a no-op write (SPEC §5).
+        let last = persist_get::<u64>(&env, &DataKey::LastHeartbeat).unwrap_or(0);
+        if now == last {
+            return;
+        }
         persist_set(&env, &DataKey::LastHeartbeat, &now);
         emit_heartbeat(&env, now);
     }
