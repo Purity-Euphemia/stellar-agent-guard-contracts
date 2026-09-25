@@ -33,6 +33,19 @@ use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, FromVal, IntoVal
 
 const SIG_EXPIRATION_LEDGER: u32 = 6_000_000;
 
+/// Number of `heartbeat` events published by the last contract invocation.
+fn heartbeat_event_count(env: &Env) -> usize {
+    let want = ScVal::Symbol(ScSymbol::try_from(std::vec::Vec::from("event_heartbeat")).unwrap());
+    env.events()
+        .all()
+        .events()
+        .iter()
+        .filter(|e| {
+            matches!(&e.body, xdr::ContractEventBody::V0(v0) if v0.topics.first() == Some(&want))
+        })
+        .count()
+}
+
 // ── Test contracts ───────────────────────────────────────────────────────
 
 #[contract]
@@ -570,6 +583,52 @@ fn rotated_agent_key_binds() {
     // Swap the harness agent to the new key and confirm it works.
     h.agent = new_key;
     h.transfer(&recv, 5);
+}
+
+#[test]
+fn redundant_same_second_heartbeat_is_a_measured_no_op() {
+    // No policy/initialize needed: `heartbeat` itself only touches
+    // `LastHeartbeat`; the policy gates live in `__check_auth`, which mock auth
+    // bypasses. This isolates the storage-write path the optimization targets.
+    let env = Env::default();
+    env.mock_all_auths();
+    let guard = env.register(PolicyEngine, ());
+    let client = PolicyEngineClient::new(&env, &guard);
+    env.ledger().set_timestamp(1_000);
+
+    // First heartbeat of the second: a real write + one event.
+    client.heartbeat();
+    let fresh_cpu = env.cost_estimate().budget().cpu_instruction_cost();
+    assert_eq!(
+        heartbeat_event_count(&env),
+        1,
+        "fresh heartbeat writes + emits"
+    );
+
+    // Second heartbeat in the same ledger second: skipped entirely.
+    client.heartbeat();
+    let redundant_cpu = env.cost_estimate().budget().cpu_instruction_cost();
+    assert_eq!(
+        heartbeat_event_count(&env),
+        0,
+        "the no-op heartbeat must not emit"
+    );
+
+    std::println!(
+        "heartbeat cpu instructions: fresh={fresh_cpu} redundant_same_second={redundant_cpu}\
+         saved={}",
+        fresh_cpu.saturating_sub(redundant_cpu)
+    );
+    assert!(
+        redundant_cpu < fresh_cpu,
+        "skipping the redundant write must cost less (fresh={fresh_cpu}, \
+         redundant={redundant_cpu})"
+    );
+
+    // Behaviour matches a write: `LastHeartbeat` is still `now`.
+    let st = client.status();
+    assert_eq!(st.last_heartbeat, 1_000);
+    assert_eq!(st.now, 1_000);
 }
 
 #[test]
