@@ -101,6 +101,10 @@ deployment (no transaction submitted). The Phase-1 fixture policy is
 `per_tx_cap: 1000, window_cap: 150, window_secs: 60, assets: [token], recipients: [GDUYLF…],
 dms_grace_secs: 60`.
 
+Recommended operator reading order: start with the policy lifecycle walkthrough
+for an end-to-end narrative of install → pause → unfreeze → revoke → reinstall:
+`docs/functions/policy-lifecycle.md`.
+
 ### `initialize`
 ```rust
 pub fn initialize(env: Env, admin: Address, agent_pubkey: BytesN<32>)
