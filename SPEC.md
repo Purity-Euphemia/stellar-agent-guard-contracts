@@ -6,6 +6,10 @@ smart-wallet policy contract, every public signature with auth-placement reasoni
 model (per-transaction cap, genuinely rolling window cap, recipient + protocol/function
 allowlists, pause, dead-man switch), and the exact enforcement scope.
 
+Documentation mapping: this specification is the **normative** source of truth for contract behavior.
+For corresponding explanatory guides, tutorials, and concept walkthroughs on the GitBook documentation
+site, see the [SPEC ↔ GitBook Cross-Reference Map](docs/README.md#spec--gitbook-cross-reference-map).
+
 Sibling context: this project builds on the research and reasoning of `agent-spend-policy` (a
 related but distinct project). Mechanism conclusions are shared; code, policy math (rolling, not
 fixed-bucket), and the product split (contracts / SDK / dashboard) are this project's own.
@@ -812,6 +816,8 @@ Rules applied (in order; the denylist is checked before the allowlist/escape hat
 3. **Per-tx cap:** resolve the effective per-tx cap for the transfer's asset — the matching
    `asset_caps` entry's `per_tx_cap` when non-zero, otherwise the global `per_tx_cap`. If the
    effective cap is non-zero, `amount <= effective_per_tx_cap` or block `PerTxCapExceeded`.
+   The comparison is exclusive-of-blocking (i.e. the cap value itself is permitted:
+   `amount == effective_per_tx_cap` is admitted; only `amount > effective_per_tx_cap` is blocked).
 4. **Rolling window (§3.1):**
    - Global window: if `window_cap != 0`, prune expired entries, then
      `total + amount <= window_cap` or block `WindowCapExceeded`.
@@ -974,7 +980,9 @@ pub fn revoke_policy(env: Env)
     // require_auth(Admin). Removes Policy and Window -> default-deny immediately.
 pub fn rotate_agent_key(env: Env, new_pubkey: BytesN<32>)
     // require_auth(Admin). Re-binds AgentPubkey. Admin never gains fund-moving
-    // power; it can only replace the key the account will authenticate.
+    // power; it can only replace the key the account will authenticate. For the
+    // operational recovery runbook (lost/compromised keys and DMS unfreeze
+    // interaction), see docs/key-rotation.md.
 pub fn propose_admin_rotation(env: Env, new_admin: Address)
     // require_auth(Admin). Stores PendingAdmin; the current admin stays
     // authoritative until confirmation. Self-proposal -> InvalidConfig.
@@ -1321,7 +1329,7 @@ filtering by the SDK listener.
 
 | Event | Topics | Data | Emitted |
 |---|---|---|---|
-| `auth_checked` | event-name topic `event_auth_checked`, then `result: Symbol` (`allowed`/`blocked`) and `reason: Symbol` (empty on allow) | Map: `context_index: u32`, `revision: u64` | every `__check_auth` / `check` decision |
+| `auth_checked` | event-name topic `event_auth_checked`, then `result: Symbol` (`allowed`/`blocked`) and `reason: Symbol` (empty on allow) | Map: `context_index: u32`, `revision: u64`, `contract: Option<Address>`, `fn_name: Option<Symbol>` | every `__check_auth` / `check` decision |
 | `heartbeat` | (none) | `at: u64`, `expires_at: u64` — the attested DMS deadline as it stood at emission time, `at + dms_grace_secs` of the policy current at that moment; `0` when the dead-man switch is disabled (`dms_grace_secs == 0`, or no policy) | on agent heartbeat (skipped when `now == LastHeartbeat`; §5) |
 | `initialized` | (none) | `by: Address` | contract initialization |
 | `frozen` | (none) | `by: Address` | admin freeze |
@@ -1656,3 +1664,27 @@ window invariant, auth-context parsing, signature verification, freeze/reversal,
 deny. Gates: `cargo test` green, `cargo clippy --all-targets --all-features` clean with
 `warnings`/`clippy::all`/`clippy::pedantic` deny, `cargo fmt --check` clean, CI (`ci` job) green
 on `main`.
+
+### 11.1 Testnet-proof criteria and fallback rationale
+
+Per [`CONTRIBUTING.md` Coding Standard 6](CONTRIBUTING.md#coding-standards) and [`tests/fixtures/README.md`](tests/fixtures/README.md):
+
+1. **User-visible enforcement changes (testnet proof entry required):**
+   - Alterations to the decision table (SPEC §§4, 6) affecting what `__check_auth` admits or blocks, or changing error codes/events emitted on allow or deny.
+   - Storage-layout, footprint, or key-schema changes affecting on-chain persistence, footprint, or contract upgrade/migration compatibility observable by callers.
+   - Adding, modifying, or removing policy/guard rules or authorization checks.
+
+2. **Changes not user-visible (no testnet proof entry required):**
+   - Pure internal gas/CPU/memory optimizations that preserve identical admit/deny decisions, storage layout, and events.
+   - Documentation, comments, or specification formatting updates.
+   - Refactorings of internal helpers, test harnesses, or test-only assertions.
+
+3. **Evidence bar & responsibility:**
+   - A valid proof entry requires an on-chain testnet transaction hash (`tx hash`) and the emitted event output (`topics: [event_auth_checked, <outcome>, <reason>]`), structured per [`tests/fixtures/README.md`](tests/fixtures/README.md) and mirrored in [`tests/fixtures/index.json`](tests/fixtures/index.json).
+   - The PR contributor proposing the change is responsible for capturing and recording the testnet proof.
+
+4. **Impractical testnet scenarios (fallback path):**
+   - If an enforcement change is impractical to demonstrate on live public testnet (e.g. extreme ledger-sequence/timestamp edge cases, complex multi-ledger rollbacks, or host resource exhaustion):
+     - The change must provide a deterministic unit/integration test in the Soroban test environment ([`src/integration_tests.rs`](src/integration_tests.rs)) covering the exact enforcement path.
+     - The PR description and proof documentation must include a written rationale explaining why testnet demonstration is impractical and how the deterministic test suite validates the invariant.
+

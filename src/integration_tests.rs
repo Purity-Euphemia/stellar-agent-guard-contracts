@@ -97,6 +97,7 @@
 //! | **Auth Entries** | `h.guard_entry(&root)` | Hashes preimage, signs with agent key, bumps nonce, returns `SorobanAuthorizationEntry`. |
 //! | | `h.guard_entry_with(key, &root)` | Signs with an arbitrary key (for testing wrong or rotated keys). |
 //! | | `h.admin_entry(&root)` | Builds auth entry for `MockAdmin` (void signature). |
+//! | | `h.non_admin_entry(account, &root)` | Builds auth entry for an arbitrary (non-admin) account. |
 //! | **Execution** | `h.enforce(entry)` | Calls `env.set_auths(&[entry])`, activating enforcing mode. |
 //! | | `h.transfer(to, amount)` | High-level: builds entry, enforces, executes transfer, asserts success. |
 //! | | `h.transfer_expect_blocked(to, amount)` | High-level: builds entry, enforces, executes transfer, asserts panic. |
@@ -640,6 +641,30 @@ impl Harness {
         self.invocation(&self.guard, "confirm_admin_rotation", std::vec![])
     }
 
+    fn cancel_admin_invocation(&self) -> SorobanAuthorizedInvocation {
+        self.invocation(&self.guard, "cancel_admin_rotation", std::vec![])
+    }
+
+    fn set_policy_invocation(&self, cfg: &PolicyConfig) -> SorobanAuthorizedInvocation {
+        self.invocation(
+            &self.guard,
+            "set_policy",
+            std::vec![cfg.clone().into_val(&self.env)],
+        )
+    }
+
+    fn revoke_policy_invocation(&self) -> SorobanAuthorizedInvocation {
+        self.invocation(&self.guard, "revoke_policy", std::vec![])
+    }
+
+    fn rotate_agent_key_invocation(&self, new_pubkey: &BytesN<32>) -> SorobanAuthorizedInvocation {
+        self.invocation(
+            &self.guard,
+            "rotate_agent_key",
+            std::vec![new_pubkey.clone().into_val(&self.env)],
+        )
+    }
+
     fn create_contract_invocation(
         &self,
         salt: &BytesN<32>,
@@ -754,6 +779,24 @@ impl Harness {
         }
     }
 
+    /// Build an auth entry for an arbitrary custom account (e.g. non-admin `MockAdmin`).
+    fn non_admin_entry(
+        &self,
+        account: &Address,
+        root: &SorobanAuthorizedInvocation,
+    ) -> SorobanAuthorizationEntry {
+        let signature_expiration_ledger = self.signature_expiration_ledger();
+        SorobanAuthorizationEntry {
+            credentials: SorobanCredentials::Address(SorobanAddressCredentials {
+                address: xdr::ScAddress::from(account),
+                nonce: 1,
+                signature_expiration_ledger,
+                signature: ScVal::Void,
+            }),
+            root_invocation: root.clone(),
+        }
+    }
+
     /// Switch the env into enforcing auth mode with exactly one entry.
     fn enforce(&mut self, entry: SorobanAuthorizationEntry) {
         self.env.set_auths(&[entry]);
@@ -852,11 +895,7 @@ impl Harness {
     /// `set_policy` once the harness has entered enforcing auth mode: the
     /// plain `install_policy` relies on mock auth and would be rejected.
     fn set_policy_enforcing(&mut self, cfg: &PolicyConfig) {
-        let root = self.invocation(
-            &self.guard,
-            "set_policy",
-            std::vec![cfg.clone().into_val(&self.env)],
-        );
+        let root = self.set_policy_invocation(cfg);
         let entry = self.admin_entry(&root);
         self.enforce(entry);
         PolicyEngineClient::new(&self.env, &self.guard).set_policy(cfg);
@@ -1440,6 +1479,39 @@ fn per_tx_cap_violation_blocked_without_window_effect() {
     .expect_transfer(&recv, 30) // total 50 — would fail if the blocked 60 had counted (110 > 100)
     .expect_transfer(&recv, 50) // total exactly 100
     .expect_block(GuardError::WindowCapExceeded, &recv, 1); // ledger genuinely full
+}
+
+/// SPEC §6.2 rule 3: `per_tx_cap` comparison is exclusive-of-blocking (inclusive cap):
+/// a transfer with `amount == per_tx_cap` is admitted; `amount == per_tx_cap + 1` is
+/// blocked with `per_tx_cap_exceeded`.
+#[test]
+fn per_tx_cap_boundary_admitted_at_cap_and_blocked_at_cap_plus_one() {
+    let mut h = Harness::new();
+    let recv = h.recv.clone();
+    let mut p = h.base_policy();
+    p.per_tx_cap = 50;
+    // Generous window cap so only the per-tx cap is exercised.
+    p.window_cap = 1_000;
+    h.install_policy(&p);
+    h.set_time(1_000);
+
+    // amount == per_tx_cap (50): admitted.
+    h.transfer(&recv, 50);
+
+    // amount == per_tx_cap + 1 (51): blocked with per_tx_cap_exceeded.
+    let reason = h.transfer_blocked_reason(&recv, 51);
+    assert!(
+        reason.contains("per_tx_cap_exceeded"),
+        "expected per_tx_cap_exceeded for amount == per_tx_cap + 1, got: {reason}"
+    );
+
+    // Preflight simulation check() also agrees on the boundary.
+    let client = PolicyEngineClient::new(&h.env, &h.guard);
+    assert_eq!(client.check(&h.asset, &recv, &50), CheckResult::Allowed);
+    assert_eq!(
+        client.check(&h.asset, &recv, &51),
+        CheckResult::Blocked(Symbol::new(&h.env, "per_tx_cap_exceeded"))
+    );
 }
 
 #[test]
@@ -3738,12 +3810,17 @@ fn batch_events_emit_in_order_with_context_index() {
             key: XdrScVal::Symbol(ScSymbol::try_from(std::vec::Vec::from(key)).unwrap()),
             val,
         };
-        // `auth_checked` data: {context_index, revision} (issue #38: the
-        // policy revision in force at decision time joins the event to the
-        // policy generation that produced it).
+        let contract: Val = h.asset.clone().into_val(&h.env);
+        // `auth_checked` data identifies the evaluated contract call as well
+        // as its position and policy generation.
         XdrScVal::Map(Some(ScMap(
             VecM::try_from(std::vec::Vec::from([
                 entry("context_index", XdrScVal::U32(idx)),
+                entry("contract", XdrScVal::from_val(&h.env, &contract)),
+                entry(
+                    "fn_name",
+                    XdrScVal::from_val(&h.env, &Symbol::new(&h.env, "transfer")),
+                ),
                 entry("revision", XdrScVal::U64(revision)),
             ]))
             .unwrap(),
@@ -5515,4 +5592,330 @@ fn unfreeze_does_not_clear_outside_active_window_until_set_policy() {
     assert_eq!(client.check(&h.asset, &recv, &10), CheckResult::Allowed);
     h.heartbeat();
     h.transfer(&recv, 10);
+}
+
+// ── Admin-gated functions (issue #365, SPEC §1 & §7) ─────────────────────
+//
+// SPEC §1 and §7 state that only the admin can change policy and manage admin
+// controls ('Admin never gains fund-moving authority' and 'only the admin can
+// change policy'). Admin calls must be rejected if authorized by a non-admin
+// principal (whether the agent key or an arbitrary external address).
+//
+// Contract methods returning `()` (`set_policy`, `revoke_policy`, `freeze`,
+// `unfreeze`, `rotate_agent_key`, `propose_admin_rotation`,
+// `cancel_admin_rotation`) panic on authorization failure via the host's
+// `require_auth` check; the Soroban SDK generates no `try_*` client method
+// for unit-returning contract functions that signals host-level auth rejection.
+// `std::panic::catch_unwind` + `std::panic::AssertUnwindSafe` is therefore the
+// standard mechanism to assert that unauthorized calls fail closed.
+
+#[test]
+fn admin_gating_set_policy_rejects_non_admin() {
+    let mut h = Harness::new();
+    let base = h.base_policy();
+    h.install_policy(&base);
+
+    let mut rogue_policy = base.clone();
+    rogue_policy.allow_any_recipient = true;
+
+    let root = h.set_policy_invocation(&rogue_policy);
+
+    // Case 1: Unauthorized random principal.
+    let non_admin = h.env.register(MockAdmin, ());
+    let entry = h.non_admin_entry(&non_admin, &root);
+    h.enforce(entry);
+
+    // `set_policy` returns `()` and the host aborts with an auth error; `try_set_policy`
+    // is not generated by the SDK for unit returns, so `catch_unwind` asserts rejection.
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PolicyEngineClient::new(&h.env, &h.guard).set_policy(&rogue_policy);
+    }));
+    assert!(
+        res.is_err(),
+        "set_policy authorized by a non-admin account must fail"
+    );
+
+    // Case 2: Agent key principal.
+    let agent_entry = h.guard_entry(&root);
+    h.enforce(agent_entry);
+
+    let res_agent = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PolicyEngineClient::new(&h.env, &h.guard).set_policy(&rogue_policy);
+    }));
+    assert!(
+        res_agent.is_err(),
+        "set_policy authorized by the agent key must fail"
+    );
+
+    // Fail-closed: policy and revision remain untouched.
+    let client = PolicyEngineClient::new(&h.env, &h.guard);
+    assert_eq!(client.policy(), Some(base));
+    assert_eq!(h.status().policy_revision, 1);
+}
+
+#[test]
+fn admin_gating_revoke_policy_rejects_non_admin() {
+    let mut h = Harness::new();
+    let base = h.base_policy();
+    h.install_policy(&base);
+
+    let root = h.revoke_policy_invocation();
+
+    // Case 1: Unauthorized random principal.
+    let non_admin = h.env.register(MockAdmin, ());
+    let entry = h.non_admin_entry(&non_admin, &root);
+    h.enforce(entry);
+
+    // `revoke_policy` returns `()`; host auth failure traps without SDK `try_*` error,
+    // so `catch_unwind` is used.
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PolicyEngineClient::new(&h.env, &h.guard).revoke_policy();
+    }));
+    assert!(
+        res.is_err(),
+        "revoke_policy authorized by a non-admin account must fail"
+    );
+
+    // Case 2: Agent key principal.
+    let agent_entry = h.guard_entry(&root);
+    h.enforce(agent_entry);
+
+    let res_agent = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PolicyEngineClient::new(&h.env, &h.guard).revoke_policy();
+    }));
+    assert!(
+        res_agent.is_err(),
+        "revoke_policy authorized by the agent key must fail"
+    );
+
+    // Fail-closed: policy is still active and revision unchanged.
+    let client = PolicyEngineClient::new(&h.env, &h.guard);
+    assert_eq!(client.policy(), Some(base));
+    assert_eq!(h.status().policy_revision, 1);
+}
+
+#[test]
+fn admin_gating_freeze_rejects_non_admin() {
+    let mut h = Harness::new();
+    assert!(!h.status().admin_frozen);
+
+    let root = h.freeze_invocation();
+
+    // Case 1: Unauthorized random principal.
+    let non_admin = h.env.register(MockAdmin, ());
+    let entry = h.non_admin_entry(&non_admin, &root);
+    h.enforce(entry);
+
+    // `freeze` returns `()`; host auth failure traps without SDK `try_*` error,
+    // so `catch_unwind` is used.
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PolicyEngineClient::new(&h.env, &h.guard).freeze();
+    }));
+    assert!(
+        res.is_err(),
+        "freeze authorized by a non-admin account must fail"
+    );
+
+    // Case 2: Agent key principal.
+    let agent_entry = h.guard_entry(&root);
+    h.enforce(agent_entry);
+
+    let res_agent = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PolicyEngineClient::new(&h.env, &h.guard).freeze();
+    }));
+    assert!(
+        res_agent.is_err(),
+        "freeze authorized by the agent key must fail"
+    );
+
+    // Fail-closed: account is still not frozen.
+    assert!(!h.status().admin_frozen);
+}
+
+#[test]
+fn admin_gating_unfreeze_rejects_non_admin() {
+    let mut h = Harness::new();
+
+    // Legitimate admin freeze.
+    h.env.mock_all_auths();
+    PolicyEngineClient::new(&h.env, &h.guard).freeze();
+    assert!(h.status().admin_frozen);
+
+    let root = h.unfreeze_invocation();
+
+    // Case 1: Unauthorized random principal.
+    let non_admin = h.env.register(MockAdmin, ());
+    let entry = h.non_admin_entry(&non_admin, &root);
+    h.enforce(entry);
+
+    // `unfreeze` returns `()`; host auth failure traps without SDK `try_*` error,
+    // so `catch_unwind` is used.
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PolicyEngineClient::new(&h.env, &h.guard).unfreeze();
+    }));
+    assert!(
+        res.is_err(),
+        "unfreeze authorized by a non-admin account must fail"
+    );
+
+    // Case 2: Agent key principal.
+    let agent_entry = h.guard_entry(&root);
+    h.enforce(agent_entry);
+
+    let res_agent = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PolicyEngineClient::new(&h.env, &h.guard).unfreeze();
+    }));
+    assert!(
+        res_agent.is_err(),
+        "unfreeze authorized by the agent key must fail"
+    );
+
+    // Fail-closed: account remains frozen.
+    assert!(h.status().admin_frozen);
+
+    // Legitimate admin unfreeze succeeds.
+    h.unfreeze();
+    assert!(!h.status().admin_frozen);
+}
+
+#[test]
+fn admin_gating_rotate_agent_key_rejects_non_admin() {
+    let mut h = Harness::new();
+    let recv = h.recv.clone();
+    h.install_policy(&h.base_policy());
+    h.set_time(1_000);
+
+    let attacker_key = SigningKey::from_bytes(&[99u8; 32]);
+    let attacker_pk = attacker_key.verifying_key().to_bytes();
+    let attacker_pk_val = BytesN::from_array(&h.env, &attacker_pk);
+
+    let root = h.rotate_agent_key_invocation(&attacker_pk_val);
+
+    // Case 1: Non-admin principal cannot rotate the agent key to its own key.
+    let non_admin = h.env.register(MockAdmin, ());
+    let entry = h.non_admin_entry(&non_admin, &root);
+    h.enforce(entry);
+
+    // `rotate_agent_key` returns `()`; host auth failure traps without SDK `try_*` error,
+    // so `catch_unwind` is used.
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PolicyEngineClient::new(&h.env, &h.guard).rotate_agent_key(&attacker_pk_val);
+    }));
+    assert!(
+        res.is_err(),
+        "rotate_agent_key authorized by a non-admin account must fail"
+    );
+
+    // Case 2: Current agent key cannot rotate the agent key either.
+    let agent_entry = h.guard_entry(&root);
+    h.enforce(agent_entry);
+
+    let res_agent = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PolicyEngineClient::new(&h.env, &h.guard).rotate_agent_key(&attacker_pk_val);
+    }));
+    assert!(
+        res_agent.is_err(),
+        "rotate_agent_key authorized by the agent key must fail"
+    );
+
+    // Assert that the attacker cannot authorize operations as the agent:
+    // the rejected rotation leaves the bound agent key unchanged.
+    let transfer_root = h.transfer_invocation(&h.guard, &recv, 10);
+    let attacker_auth = h.guard_entry_with(&attacker_key, &transfer_root);
+    h.enforce(attacker_auth);
+
+    let res_transfer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        MockAssetClient::new(&h.env, &h.asset).transfer(&h.guard, &recv, &10);
+    }));
+    assert!(
+        res_transfer.is_err(),
+        "attacker who failed to bind key must not authorize as agent"
+    );
+
+    // Legitimate agent key still authorizes transfers successfully.
+    h.transfer(&recv, 10);
+}
+
+#[test]
+fn admin_gating_propose_admin_rotation_rejects_non_admin() {
+    let mut h = Harness::new();
+    let rogue_admin = Address::generate(&h.env);
+
+    let root = h.propose_admin_invocation(&rogue_admin);
+
+    // Case 1: Unauthorized random principal.
+    let non_admin = h.env.register(MockAdmin, ());
+    let entry = h.non_admin_entry(&non_admin, &root);
+    h.enforce(entry);
+
+    // `propose_admin_rotation` returns `()`; host auth failure traps without SDK `try_*` error,
+    // so `catch_unwind` is used.
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PolicyEngineClient::new(&h.env, &h.guard).propose_admin_rotation(&rogue_admin);
+    }));
+    assert!(
+        res.is_err(),
+        "propose_admin_rotation authorized by a non-admin account must fail"
+    );
+
+    // Case 2: Agent key principal.
+    let agent_entry = h.guard_entry(&root);
+    h.enforce(agent_entry);
+
+    let res_agent = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PolicyEngineClient::new(&h.env, &h.guard).propose_admin_rotation(&rogue_admin);
+    }));
+    assert!(
+        res_agent.is_err(),
+        "propose_admin_rotation authorized by the agent key must fail"
+    );
+
+    // Fail-closed: pending admin slot remains empty.
+    let (_, pending) = h.stored_admins();
+    assert!(pending.is_none());
+}
+
+#[test]
+fn admin_gating_cancel_admin_rotation_rejects_non_admin() {
+    let mut h = Harness::new();
+    let new_admin = Address::generate(&h.env);
+
+    // Admin legitimately proposes rotation.
+    h.env.mock_all_auths();
+    PolicyEngineClient::new(&h.env, &h.guard).propose_admin_rotation(&new_admin);
+    let (_, pending) = h.stored_admins();
+    assert_eq!(pending, Some(new_admin.clone()));
+
+    let root = h.cancel_admin_invocation();
+
+    // Case 1: Unauthorized random principal.
+    let non_admin = h.env.register(MockAdmin, ());
+    let entry = h.non_admin_entry(&non_admin, &root);
+    h.enforce(entry);
+
+    // `cancel_admin_rotation` returns `()`; host auth failure traps without SDK `try_*` error,
+    // so `catch_unwind` is used.
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PolicyEngineClient::new(&h.env, &h.guard).cancel_admin_rotation();
+    }));
+    assert!(
+        res.is_err(),
+        "cancel_admin_rotation authorized by a non-admin account must fail"
+    );
+
+    // Case 2: Agent key principal.
+    let agent_entry = h.guard_entry(&root);
+    h.enforce(agent_entry);
+
+    let res_agent = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PolicyEngineClient::new(&h.env, &h.guard).cancel_admin_rotation();
+    }));
+    assert!(
+        res_agent.is_err(),
+        "cancel_admin_rotation authorized by the agent key must fail"
+    );
+
+    // Fail-closed: pending admin rotation is not cancelled.
+    let (_, pending) = h.stored_admins();
+    assert_eq!(pending, Some(new_admin));
 }

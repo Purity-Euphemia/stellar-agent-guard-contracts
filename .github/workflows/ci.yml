@@ -7,8 +7,14 @@ on:
 
 jobs:
   # Job name must stay exactly `ci`: the repo's `main-protection` ruleset
-  # (phase 0) requires the `ci` status check on `main`.
+  # requires the `ci` status check on `main` (recorded in
+  # `.github/rulesets/main-protection.json`). Renaming this key means no check
+  # named `ci` is ever reported, so every PR — including Dependabot's — blocks
+  # forever on "Expected — Waiting for status to be reported". The full
+  # consequence and the safe-rename procedure are in
+  # `.github/BRANCH_PROTECTION.md`.
   ci:
+    timeout-minutes: 45
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -70,12 +76,19 @@ jobs:
       - name: Contract build (wasm32v1-none)
         run: cargo build --release --target wasm32v1-none
 
+      - name: Check release WASM for panic/unwrap strings
+        run: bash scripts/check-wasm-panic-strings.sh
+
       - name: Verify README claims
         run: scripts/verify-readme.sh
 
       - name: Verify documentation reachability
         run: scripts/verify-docs-reachability.sh
 
+      # tools/agent-tx is a separate cargo project (its own Cargo.toml and
+      # Cargo.lock), so none of the gates above see it. It signs and submits
+      # guard authorization entries, so it gets the same gates, not just a
+      # build. Keep this list in sync with CONTRIBUTING.md's local-gate block.
       - name: Agent submission tool format check (tools/agent-tx)
         run: cargo fmt --manifest-path tools/agent-tx/Cargo.toml --check
 
