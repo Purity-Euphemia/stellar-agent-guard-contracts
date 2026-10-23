@@ -71,9 +71,13 @@ what Phase 2's SDK must do:
    against live testnet state, so policy blocks surface pre-broadcast.
 3. On approval, submit and report the on-chain result.
 
-Each invocation uses a fresh tx sequence as the auth nonce (the SAC's replay
-protection records every consumed nonce on-chain; the guard's own `__check_auth`
-ignores nonces, per SPEC §6).
+Each invocation draws a fresh auth nonce: the latest ledger sequence in the high
+32 bits and 32 bits of OS randomness in the low 32, independent of the tx
+sequence, so a retry after a failed or unconsumed attempt never reuses one (the
+host records every consumed nonce on-chain until the entry's signature
+expiration; the guard's own `__check_auth` ignores nonces, per SPEC §6). The
+collision argument is on `auth_nonce` in `tools/agent-tx/src/main.rs`. The runs
+below predate this and used the tx sequence as the nonce.
 
 `agent-tx transfer-from` now builds `transfer_from(from, guard, to, amount)` with
 the guard as spender and preserves the token contract's exact argument order.

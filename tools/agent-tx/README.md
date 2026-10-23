@@ -44,6 +44,13 @@ agent-tx status --guard C... --network futurenet
 - `--network-passphrase <phrase>` overrides a preset passphrase or specifies the
   network identity for a custom node (for example, a local `stellar standalone`
   network or a fork). The resolved passphrase source is printed before submission.
+- `--rpc-timeout <secs>` bounds every RPC request (connect, send, and reading the
+  response; default 30). A stalled endpoint ends the invocation with
+  `RESULT: RPC TIMEOUT`, exit code 3 and a message naming the RPC method, instead
+  of hanging. A timed-out `getTransaction` poll counts as still pending; a
+  timed-out `sendTransaction` prints the locally computed tx hash so you can check
+  it before resubmitting. The tool does not retry on its own: retries belong to
+  the caller (see the Troubleshooting table).
 - Selecting mainnet prints a one-line reminder on stderr that this contract is
   unaudited and gates real funds; see the repository [SECURITY.md](../../SECURITY.md).
 

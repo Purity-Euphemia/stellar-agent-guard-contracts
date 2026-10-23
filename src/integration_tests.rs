@@ -5919,3 +5919,149 @@ fn admin_gating_cancel_admin_rotation_rejects_non_admin() {
     let (_, pending) = h.stored_admins();
     assert_eq!(pending, Some(new_admin));
 }
+
+// ── Admin functions before `initialize` (issue #364) ─────────────────────
+//
+// `admin_or_panic` (src/lib.rs) is the single gate in front of every admin
+// write: with no admin stored it panics `NotInitialized`, so a guard that was
+// registered but never initialized cannot accept a policy, rotate its key, or
+// flip the freeze switch. Default-deny depends on every state path failing
+// closed — the administrative ones included — but this `NotInitialized` arm
+// had no coverage: `initialize`'s double-call rejection was tested, the
+// pre-init rejection of every other admin function was not.
+//
+// These assertions use the generated `try_*` client methods rather than
+// `catch_unwind`. `try_*` is generated for unit-returning contract functions
+// too, and it distinguishes a contract error (`Err(Ok(..))`, the
+// `panic_with_error!` path this test targets) from a host-level failure
+// (`Err(Err(..))`), so the exact error code is asserted instead of just "it
+// panicked".
+
+/// The contract error carried by a generated `try_*` call, or a panic naming
+/// how the call failed to be one.
+fn try_contract_error<T, E>(
+    res: Result<Result<T, E>, Result<soroban_sdk::Error, InvokeError>>,
+) -> GuardError
+where
+    T: std::fmt::Debug,
+    E: std::fmt::Debug,
+{
+    match res {
+        Err(Ok(err)) => GuardError::try_from(err).expect("unknown contract error code"),
+        Ok(ok) => panic!("expected a contract error, but the call succeeded: {ok:?}"),
+        Err(Err(host)) => panic!("expected a contract error, but the host failed: {host:?}"),
+    }
+}
+
+#[test]
+fn admin_functions_reject_with_not_initialized_before_initialize() {
+    let h = Harness::new();
+    // A freshly registered guard: no `initialize` call was ever made, so no
+    // admin address is stored and there is no key or policy state either.
+    let guard = h.env.register(PolicyEngine, ());
+    let client = PolicyEngineClient::new(&h.env, &guard);
+
+    let status_before = client.status();
+    assert!(!status_before.has_policy, "a fresh guard has no policy");
+    assert_eq!(status_before.policy_revision, 0);
+    assert!(!status_before.admin_frozen);
+    assert_eq!(status_before.last_heartbeat, 0);
+
+    // Raw state the `status` snapshot does not expose (the bound agent key and
+    // the rolling ledger), read as the contract so it sees the stored bytes.
+    let stored_agent_key = || {
+        h.env.as_contract(&guard, || {
+            h.env
+                .storage()
+                .instance()
+                .get::<DataKey, BytesN<32>>(&DataKey::AgentPubkey)
+        })
+    };
+    let stored_window = || {
+        h.env.as_contract(&guard, || {
+            h.env
+                .storage()
+                .persistent()
+                .get::<DataKey, WindowState>(&DataKey::Window)
+        })
+    };
+    assert!(stored_agent_key().is_none());
+    assert!(stored_window().is_none());
+
+    // After each rejection the whole observable state must be byte-identical
+    // to the pre-call snapshot: no policy, no agent key, no window, no
+    // revision/freeze/heartbeat movement, and no lifecycle event (a rejected
+    // admin call emits nothing; the event log still holds its own invocation).
+    let assert_unchanged = |label: &str| {
+        assert!(
+            h.env.events().all().events().is_empty(),
+            "`{label}` before initialize must not emit an event"
+        );
+        assert_eq!(
+            client.status(),
+            status_before,
+            "`{label}` before initialize must leave the status snapshot untouched"
+        );
+        assert!(
+            client.policy().is_none(),
+            "`{label}` before initialize must not install a policy"
+        );
+        assert!(
+            stored_agent_key().is_none(),
+            "`{label}` before initialize must not bind an agent key"
+        );
+        assert!(
+            stored_window().is_none(),
+            "`{label}` before initialize must not create a window"
+        );
+    };
+
+    // Every admin entrypoint, driven against the uninitialized account. The
+    // candidate policy and key are valid on their own, so the only thing that
+    // can reject them here is the missing admin.
+    assert_eq!(
+        try_contract_error(client.try_set_policy(&h.base_policy())),
+        GuardError::NotInitialized,
+        "set_policy before initialize must fail closed with NotInitialized"
+    );
+    assert_unchanged("set_policy");
+
+    assert_eq!(
+        try_contract_error(client.try_revoke_policy()),
+        GuardError::NotInitialized,
+        "revoke_policy before initialize must fail closed with NotInitialized"
+    );
+    assert_unchanged("revoke_policy");
+
+    let new_pubkey = BytesN::from_array(&h.env, &[9u8; 32]);
+    assert_eq!(
+        try_contract_error(client.try_rotate_agent_key(&new_pubkey)),
+        GuardError::NotInitialized,
+        "rotate_agent_key before initialize must fail closed with NotInitialized"
+    );
+    assert_unchanged("rotate_agent_key");
+
+    assert_eq!(
+        try_contract_error(client.try_freeze()),
+        GuardError::NotInitialized,
+        "freeze before initialize must fail closed with NotInitialized"
+    );
+    assert_unchanged("freeze");
+
+    assert_eq!(
+        try_contract_error(client.try_unfreeze()),
+        GuardError::NotInitialized,
+        "unfreeze before initialize must fail closed with NotInitialized"
+    );
+    assert_unchanged("unfreeze");
+
+    // Sanity: once the same account is initialized the identical call is
+    // accepted, so the rejections above came from the missing admin and not
+    // from a broken harness or an invalid candidate policy.
+    h.env.mock_all_auths();
+    let pk = h.agent.verifying_key().to_bytes();
+    client.initialize(&h.admin, &BytesN::from_array(&h.env, &pk));
+    client.set_policy(&h.base_policy());
+    assert!(client.policy().is_some());
+    assert!(client.status().has_policy);
+}

@@ -24,29 +24,36 @@ cd stellar-agent-guard-contracts
 # CI sees. If you change the gate, change this block, the README's Testing &
 # CI section, and the workflow in the same PR.
 
-# 1. Format check
+# 1. Dependency security and license policy
+# Install cargo-deny once, then check dependencies against deny.toml.
+cargo install --locked cargo-deny
+cargo deny check
+
+# 2. Format check
 cargo fmt --check
 
-# 2. Clippy. The `-D warnings` flag is what makes this a gate; without it the
-#    `[lints.clippy] all/pedantic = "deny"` groups still print as warnings and
-#    the command exits 0 while CI fails.
+# 3. Clippy. The `-D warnings` flag makes this a gate; without it the
+#    `[lints.clippy] all/pedantic = "deny"` groups still print as warnings.
 cargo clippy --all-targets --all-features -- -D warnings
 
-# 3. Unit + integration tests (224 tests, no network needed)
+# 4. Unit + integration tests
 cargo test
 
-# 4. Public API documentation, warnings denied
+# 5. Public API documentation, warnings denied
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
-# 5. Build the contract wasm (Soroban 27 targets wasm32v1-none)
+# 6. Build the contract wasm (Soroban 27 targets wasm32v1-none)
 cargo build --release --target wasm32v1-none
 
-# 6. Audit README claims, then verify every page under docs/ is reachable
+# 7. Check the release WASM for panic/unwrap strings
+bash scripts/check-wasm-panic-strings.sh
+
+# 8. Audit README claims and verify docs reachability
 scripts/verify-readme.sh
 scripts/verify-docs-reachability.sh
 
-# 7. tools/agent-tx is a separate cargo project (its own Cargo.toml and
-#    Cargo.lock — not a workspace member), so steps 1-6 never see it. CI gates
+# 9. tools/agent-tx is a separate cargo project (its own Cargo.toml and
+#    Cargo.lock — not a workspace member), so steps 1-8 never see it. CI gates
 #    it explicitly with the same four commands; run them here too, because the
 #    build alone does not run its tests.
 cargo fmt --manifest-path tools/agent-tx/Cargo.toml --check
@@ -118,6 +125,17 @@ The `stellar` CLI cannot sign Soroban authorization entries whose address is a
 contract. Heartbeat testing uses the guard contract's own address, so the CLI
 cannot submit a heartbeat; use `agent-tx` for this path. See the
 [`agent-tx` usage guide](tools/agent-tx/README.md) for commands and options.
+
+## PolicyConfig deserialization fuzzing
+
+The bounded CI smoke run seeds valid empty and non-empty policies and fuzzes the ScVal XDR decoder plus the production §8 validation path for 60 seconds. It rejects malformed XDR, maps malformed policy values to the stable InvalidConfig error, and treats any panic as a fuzz finding.
+
+Install cargo-fuzz with cargo install cargo-fuzz --locked, then run locally:
+
+    cargo run --manifest-path fuzz/Cargo.toml --bin seed-policy-config
+    cargo +nightly fuzz run policy_config_deserialization -- -max_total_time=600 -max_len=4096
+
+The corpus is stored under fuzz/corpus/policy_config_deserialization; minimized failures are written under fuzz/artifacts/policy_config_deserialization.
 
 ## Clean Build Artifacts
 

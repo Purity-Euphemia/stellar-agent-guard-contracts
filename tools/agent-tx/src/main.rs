@@ -42,11 +42,95 @@ use base32::strkey_encode;
 use ed25519_dalek::{Signer, SigningKey};
 use network::{Endpoint, Network};
 use sha2::{Digest, Sha256};
+use std::time::Duration;
 use stellar_xdr::*;
 use strkey::KeyKind;
 
 const INCLUSION_FEE: u32 = 100;
+
+// ── Guard-footprint fee allowance (issue #382) ───────────────────────────
+//
+// `GUARD_KEY_FEE_BUMP` is added to both the declared `resource_fee` and the
+// total fee. It is a ceiling, not a price: core charges the non-refundable
+// part of `resource_fee` from the *declared resources*, the refundable part
+// (rent, events, return value) from actual use, and refunds the remainder.
+// Over-provisioning only reserves balance; under-provisioning fails the tx.
+//
+// What it pays for. `merge_guard_footprint` can add up to
+// `GUARD_FOOTPRINT_KEYS` read-write entries the simulation did not declare,
+// so did not price. Each one raises the non-refundable fee by a
+// `fee_write_ledger_entry` and grows the envelope (tx-size and historical
+// fees). Core takes that out of `resource_fee` before computing what is left
+// for refundable charges; unbudgeted, the remainder cannot cover rent and the
+// tx fails with `insufficient_refundable_fee`. On top of that, instruction
+// headroom for `__check_auth` work the simulation under-measures.
+//
+// Derivation, from the mainnet `ConfigSetting` entries read on 2026-10-18 at
+// ledger 65,008,194 (testnet charges half of each; re-read them with
+// `getLedgerEntries` on `ContractLedgerCostV0`/`ContractLedgerCostExtV0`/
+// `ContractBandwidthV0`/`ContractHistoricalDataV0`/`ContractComputeV0`):
+//
+//   write entries   5 keys × 2,500                         = 12,500
+//   envelope bytes  5 keys × ≤128 B × (406 + 4,059) / KiB  =  2,791 (rounded up)
+//   instructions    10,000,000 × 7 / 10,000                =  7,000
+//                                                            ------
+//   worst case at the current schedule                       22,291 stroops
+//
+// The constant stays at 100,000 (≈4.5× that) because the schedule is
+// validator-voted and has historically been several times higher, and unused
+// allowance is refunded. A compile-time assertion below keeps the derivation
+// under the constant if a key is added or an input is raised.
+//
+// It does *not* scale with the policy's list sizes. Longer allowlists make
+// the `Policy` and `Window` entries bigger and `__check_auth` slower, but the
+// signed simulation in `run` executes the real `__check_auth`, so those bytes
+// and instructions are already measured into `minResourceFee`. The merge only
+// changes the *number* of entries, which is fixed by `GuardKey` (four data
+// keys plus the instance), whatever the policy holds.
+//
+// How an operator recognises it is too low: the submission ends in
+// `RESULT: FAILED` with a `resultXdr` decoding to
+// `INVOKE_HOST_FUNCTION_INSUFFICIENT_REFUNDABLE_FEE` (or `sendTransaction`
+// refuses it as `txSOROBAN_INVALID` when even the non-refundable part is
+// short). Re-run with `AGENT_TX_DEBUG=1` to print `footprint merge added N
+// keys` and the `minResourceFee` / `resourceFee` / final-fee breakdown, then
+// update the inputs below from the live `ConfigSetting` entries.
+//
+// Interaction with #381 (declaring read-only guard keys read-only): once only
+// the keys `__check_auth` writes are read-write, the write-entry term covers
+// those keys alone and the read-only ones cost no write fee, so
+// `GUARD_FOOTPRINT_KEYS` in the first term should become the read-write count.
+
+/// Footprint entries `merge_guard_footprint` can add: every `GuardKey` the
+/// auth check reads, plus the guard's instance entry.
+const GUARD_FOOTPRINT_KEYS: i64 = GuardKey::CHECK_AUTH_READS.len() as i64 + 1;
+/// `ContractLedgerCostV0.fee_write_ledger_entry`, stroops per entry.
+const FEE_WRITE_LEDGER_ENTRY: i64 = 2_500;
+/// `ContractBandwidthV0.fee_tx_size1_kb`, stroops per KiB of envelope.
+const FEE_TX_SIZE_1KB: i64 = 406;
+/// `ContractHistoricalDataV0.fee_historical1_kb`, stroops per KiB of envelope.
+const FEE_HISTORICAL_1KB: i64 = 4_059;
+/// `ContractComputeV0.fee_rate_per_instructions_increment`, stroops per
+/// 10,000 instructions.
+const FEE_PER_10K_INSTRUCTIONS: i64 = 7;
+/// Upper bound on one guard `LedgerKey`'s XDR size (checked by a unit test).
+const GUARD_KEY_XDR_BYTES_MAX: i64 = 128;
+/// Instructions of headroom for `__check_auth`: 2.5% of the 400M per-tx limit.
+const CHECK_AUTH_INSTRUCTION_HEADROOM: i64 = 10_000_000;
+
+/// The worst-case cost the allowance must cover, per the derivation above.
+const fn guard_key_fee_floor() -> i64 {
+    let write_entries = GUARD_FOOTPRINT_KEYS * FEE_WRITE_LEDGER_ENTRY;
+    let key_bytes = GUARD_FOOTPRINT_KEYS * GUARD_KEY_XDR_BYTES_MAX;
+    let envelope = (key_bytes * (FEE_TX_SIZE_1KB + FEE_HISTORICAL_1KB) + 1023) / 1024;
+    let instructions = CHECK_AUTH_INSTRUCTION_HEADROOM * FEE_PER_10K_INSTRUCTIONS / 10_000;
+    write_entries + envelope + instructions
+}
+
+/// Stroops added to the declared resource fee and the total fee for the guard
+/// keys the simulation may not have priced. See the derivation above.
 const GUARD_KEY_FEE_BUMP: u32 = 100_000;
+const _: () = assert!(guard_key_fee_floor() <= GUARD_KEY_FEE_BUMP as i64);
 
 /// Outcome of the transaction submission process.
 #[derive(Debug, PartialEq)]
@@ -128,12 +212,40 @@ fn contract_strkey(id: &[u8; 32]) -> String {
 
 // ── RPC ──────────────────────────────────────────────────────────────────
 
+/// Per-request RPC timeout when `--rpc-timeout` is not given. It bounds the
+/// whole request — connect, send, and reading the response — so a stalled or
+/// black-holed endpoint fails the invocation instead of hanging it.
+const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
 struct Rpc {
     url: String,
+    timeout: Duration,
+    agent: ureq::Agent,
+}
+
+/// Whether an error, or anything in its source chain, is an I/O timeout.
+/// ureq reports its overall timeout as `io::ErrorKind::TimedOut` (and some
+/// platforms surface a socket read timeout as `WouldBlock`).
+fn is_io_timeout(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur = Some(err);
+    while let Some(e) = cur {
+        if let Some(io) = e.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ) {
+                return true;
+            }
+        }
+        cur = e.source();
+    }
+    false
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RpcFailureKind {
+    /// No complete response within `--rpc-timeout` (connect, send, or read).
+    Timeout,
     Transport,
     Http,
     JsonRpc,
@@ -152,6 +264,7 @@ struct RpcError {
 impl RpcError {
     fn label(&self) -> &'static str {
         match self.kind {
+            RpcFailureKind::Timeout => "RPC TIMEOUT",
             RpcFailureKind::Transport => "TRANSPORT FAILURE",
             RpcFailureKind::Http => "HTTP RPC FAILURE",
             RpcFailureKind::JsonRpc => "JSON-RPC REJECTION",
@@ -161,9 +274,13 @@ impl RpcError {
 
     fn exit_code(&self) -> i32 {
         match self.kind {
-            RpcFailureKind::Transport | RpcFailureKind::Http => 3,
+            RpcFailureKind::Timeout | RpcFailureKind::Transport | RpcFailureKind::Http => 3,
             RpcFailureKind::JsonRpc | RpcFailureKind::InvalidResponse => 4,
         }
+    }
+
+    fn is_timeout(&self) -> bool {
+        self.kind == RpcFailureKind::Timeout
     }
 }
 
@@ -183,12 +300,19 @@ impl std::fmt::Display for RpcError {
 fn rpc_or_exit<T>(result: Result<T, RpcError>) -> T {
     match result {
         Ok(value) => value,
-        Err(error) => {
-            eprintln!("RESULT: {}", error.label());
-            eprintln!("{error}");
-            std::process::exit(error.exit_code());
-        }
+        Err(error) => rpc_exit(&error, None),
     }
+}
+
+/// Print the classified RPC failure (plus an optional hint line) and exit
+/// with its code.
+fn rpc_exit(error: &RpcError, hint: Option<String>) -> ! {
+    eprintln!("RESULT: {}", error.label());
+    eprintln!("{error}");
+    if let Some(hint) = hint {
+        eprintln!("{hint}");
+    }
+    std::process::exit(error.exit_code());
 }
 
 trait PreflightRpc {
@@ -200,6 +324,17 @@ trait PreflightRpc {
 }
 
 impl Rpc {
+    fn new(url: String, timeout: Duration) -> Self {
+        let agent = ureq::AgentBuilder::new().timeout(timeout).build();
+        Self {
+            url,
+            timeout,
+            agent,
+        }
+    }
+
+    /// One JSON-RPC request, bounded by the timeout, with every failure
+    /// classified rather than panicking.
     fn post(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, RpcError> {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
@@ -207,12 +342,28 @@ impl Rpc {
             "method": method,
             "params": params,
         });
-        let response = ureq::post(&self.url)
+        let timeout = || RpcError {
+            method: method.to_string(),
+            kind: RpcFailureKind::Timeout,
+            http_status: None,
+            json_rpc_code: None,
+            message: format!(
+                "no response from {} within {}s. The endpoint may be down or overloaded: \
+                 retry, raise --rpc-timeout <secs>, or pick another endpoint with \
+                 --network/--rpc-url",
+                self.url,
+                self.timeout.as_secs_f64()
+            ),
+        };
+        let response = self
+            .agent
+            .post(&self.url)
             .set("Content-Type", "application/json")
             .send_string(&body.to_string());
         let response = match response {
             Ok(response) => response,
             Err(ureq::Error::Status(_, response)) => response,
+            Err(ureq::Error::Transport(error)) if is_io_timeout(&error) => return Err(timeout()),
             Err(ureq::Error::Transport(error)) => {
                 return Err(RpcError {
                     method: method.to_string(),
@@ -224,12 +375,20 @@ impl Rpc {
             }
         };
         let status = response.status();
-        let response_body = response.into_string().map_err(|error| RpcError {
-            method: method.to_string(),
-            kind: RpcFailureKind::InvalidResponse,
-            http_status: Some(status),
-            json_rpc_code: None,
-            message: error.to_string(),
+        // The timeout also bounds reading the body: a server that sends
+        // headers and then stalls ends here, not in a hang.
+        let response_body = response.into_string().map_err(|error| {
+            if is_io_timeout(&error) {
+                timeout()
+            } else {
+                RpcError {
+                    method: method.to_string(),
+                    kind: RpcFailureKind::InvalidResponse,
+                    http_status: Some(status),
+                    json_rpc_code: None,
+                    message: error.to_string(),
+                }
+            }
         })?;
         let json: serde_json::Value =
             serde_json::from_str(&response_body).map_err(|error| RpcError {
@@ -303,15 +462,15 @@ impl Rpc {
         ))
     }
 
-    fn send(&self, envelope: &str) -> serde_json::Value {
-        rpc_or_exit(self.post(
+    fn send(&self, envelope: &str) -> Result<serde_json::Value, RpcError> {
+        self.post(
             "sendTransaction",
             serde_json::json!({ "transaction": envelope }),
-        ))
+        )
     }
 
-    fn get_tx(&self, hash: &str) -> serde_json::Value {
-        rpc_or_exit(self.post("getTransaction", serde_json::json!({ "hash": hash })))
+    fn get_tx(&self, hash: &str) -> Result<serde_json::Value, RpcError> {
+        self.post("getTransaction", serde_json::json!({ "hash": hash }))
     }
 
     fn inclusion_fee(&self) -> Result<Option<u32>, RpcError> {
@@ -536,19 +695,69 @@ fn is_guard_auth_checked_block(simulation: &serde_json::Value, guard: &ScAddress
 
 // ── Footprint helpers ────────────────────────────────────────────────────
 
-fn guard_data_key(guard: &ScAddress, name: &str) -> LedgerKey {
+/// The guard's persistent `DataKey` variants (src/types.rs) that
+/// `__check_auth` reads — `AuthSnapshot::load` and `save_ledger` in
+/// src/lib.rs. The names are not free text: the unit tests check each one's
+/// encoding byte-for-byte against `guard-storage-keys.json`, which the
+/// contract's own test suite generates from the real `DataKey`, so renaming a
+/// variant fails both suites instead of silently declaring a wrong footprint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuardKey {
+    Policy,
+    Window,
+    LastHeartbeat,
+    AdminFrozen,
+}
+
+impl GuardKey {
+    /// Every key `__check_auth` touches, in footprint order.
+    const CHECK_AUTH_READS: [GuardKey; 4] = [
+        GuardKey::Policy,
+        GuardKey::Window,
+        GuardKey::LastHeartbeat,
+        GuardKey::AdminFrozen,
+    ];
+
+    /// The `DataKey` variant name, which is also its on-ledger symbol.
+    fn variant(self) -> &'static str {
+        match self {
+            GuardKey::Policy => "Policy",
+            GuardKey::Window => "Window",
+            GuardKey::LastHeartbeat => "LastHeartbeat",
+            GuardKey::AdminFrozen => "AdminFrozen",
+        }
+    }
+
+    /// The key as the contract stores it. `#[contracttype]` encodes a unit
+    /// enum variant as a one-element vector holding its name, not a bare
+    /// symbol: `DataKey::Policy` is `Vec[Symbol("Policy")]`.
+    fn scval(self) -> ScVal {
+        let name = ScVal::Symbol(ScSymbol(
+            self.variant()
+                .try_into()
+                .expect("DataKey variant name fits a symbol"),
+        ));
+        ScVal::Vec(Some(ScVec(
+            VecM::try_from(vec![name]).expect("one-element vector"),
+        )))
+    }
+}
+
+fn guard_data_key(guard: &ScAddress, key: GuardKey) -> LedgerKey {
     LedgerKey::ContractData(LedgerKeyContractData {
         contract: guard.clone(),
-        key: ScVal::Symbol(ScSymbol(name.try_into().unwrap())),
+        key: key.scval(),
         durability: ContractDataDurability::Persistent,
     })
 }
 
+/// A contract instance lives in *persistent* storage under the reserved
+/// `LedgerKeyContractInstance` key.
 fn guard_instance_key(guard: &ScAddress) -> LedgerKey {
     LedgerKey::ContractData(LedgerKeyContractData {
         contract: guard.clone(),
         key: ScVal::LedgerKeyContractInstance,
-        durability: ContractDataDurability::Temporary,
+        durability: ContractDataDurability::Persistent,
     })
 }
 
@@ -566,14 +775,14 @@ enum CallKind {
 /// Target key in contract storage.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum StorageTarget {
-    Persistent(&'static str),
+    Persistent(GuardKey),
     Instance,
 }
 
 impl StorageTarget {
     fn to_ledger_key(self, guard: &ScAddress) -> LedgerKey {
         match self {
-            Self::Persistent(name) => guard_data_key(guard, name),
+            Self::Persistent(key) => guard_data_key(guard, key),
             Self::Instance => guard_instance_key(guard),
         }
     }
@@ -621,19 +830,19 @@ struct StorageKeyTouch {
 /// - Instance: contains contract instance, admin, and agent pubkey; declared read-write as engine may write TTL.
 const GUARD_STORAGE_TOUCHES: &[StorageKeyTouch] = &[
     StorageKeyTouch {
-        target: StorageTarget::Persistent("Policy"),
+        target: StorageTarget::Persistent(GuardKey::Policy),
         written_on: WriteCondition::Never,
     },
     StorageKeyTouch {
-        target: StorageTarget::Persistent("AdminFrozen"),
+        target: StorageTarget::Persistent(GuardKey::AdminFrozen),
         written_on: WriteCondition::Never,
     },
     StorageKeyTouch {
-        target: StorageTarget::Persistent("Window"),
+        target: StorageTarget::Persistent(GuardKey::Window),
         written_on: WriteCondition::OnTransfer,
     },
     StorageKeyTouch {
-        target: StorageTarget::Persistent("LastHeartbeat"),
+        target: StorageTarget::Persistent(GuardKey::LastHeartbeat),
         written_on: WriteCondition::OnHeartbeat,
     },
     StorageKeyTouch {
@@ -732,7 +941,7 @@ fn preflight<R: PreflightRpc>(call: &Call, args: &Args, rpc: &R) -> Result<(), i
             VecM::try_from(vec![build_auth_entry(
                 &args.guard,
                 &invocation,
-                seq,
+                fresh_auth_nonce(latest),
                 sig_exp,
                 &network_id,
                 agent,
@@ -775,6 +984,7 @@ fn preflight<R: PreflightRpc>(call: &Call, args: &Args, rpc: &R) -> Result<(), i
         .expect("simulation minResourceFee")
         .parse()
         .expect("simulation fee");
+    // Quote what `run` would pay, allowance included (see GUARD_KEY_FEE_BUMP).
     let (inclusion_fee, fee_source) = resolve_inclusion_fee(rpc, args.inclusion_fee_override);
     let fee = calculate_fee(min_fee, inclusion_fee);
     if agent.is_some() {
@@ -840,13 +1050,10 @@ fn invoke_op(invocation: &InvokeContractArgs, auth: VecM<SorobanAuthorizationEnt
 /// over the `HashIdPreimage::SorobanAuthorization` payload. This is the same
 /// payload the host hands to `__check_auth`.
 ///
-/// The nonce must be a value this address has never used before: the host
-/// records every consumed nonce in ledger state (`(address, LedgerKeyNonce)`)
-/// and rejects replays ("nonce already exists for address"). The guard's own
-/// `__check_auth` ignores nonces, but the *token contract's* `require_auth`
-/// on the inner call still enforces them, so each transaction needs a fresh
-/// one. The agent's strictly-increasing tx sequence is unique per transaction
-/// and never reused, so it doubles as the auth nonce.
+/// The nonce must be one this address has no live record of: the host records
+/// every consumed nonce in ledger state (`(address, LedgerKeyNonce)`) until
+/// the entry's signature expiration and rejects replays ("nonce already
+/// exists for address"). See [`auth_nonce`] for how it is chosen.
 fn build_auth_entry(
     guard: &ScAddress,
     invocation: &InvokeContractArgs,
@@ -882,6 +1089,48 @@ fn build_auth_entry(
     }
 }
 
+/// The guard auth nonce: the latest ledger sequence in the high 32 bits and
+/// 32 bits of entropy in the low 32 (the bit pattern, reinterpreted as `i64`).
+///
+/// Replay argument. Replay protection is the host's: a consumed nonce stays
+/// recorded for the guard address until the entry's signature expiration
+/// ledger, and a second use while recorded is rejected. That holds for any
+/// nonce choice, so the choice only affects liveness — a collision makes a
+/// fresh transaction fail spuriously, never makes a signed one run twice.
+///
+/// Collision argument. Ledger sequences never repeat, so nonces drawn in
+/// different ledgers differ in their high half and cannot collide. Two drawn
+/// in the same ledger collide only if their entropy matches: 2^-32 per pair.
+/// Nothing depends on the transaction sequence, which the previous scheme
+/// reused as the nonce: a retry after an attempt that never consumed its
+/// sequence (a `txBAD_SEQ`, a rejected or dropped submission) or one that
+/// did (a failed apply) draws a new nonce either way. Nonces from that older
+/// scheme carry the agent account's *creation* ledger in their high half
+/// (Stellar starts an account's sequence at `ledger << 32`), which is always
+/// below the current ledger, so the two schemes cannot overlap either.
+fn auth_nonce(latest_ledger: u32, entropy: u32) -> i64 {
+    ((u64::from(latest_ledger) << 32) | u64::from(entropy)) as i64
+}
+
+/// [`auth_nonce`] with the low half drawn from the OS's secure RNG.
+fn fresh_auth_nonce(latest_ledger: u32) -> i64 {
+    let mut entropy = [0u8; 4];
+    getrandom::getrandom(&mut entropy)
+        .unwrap_or_else(|e| exit_with(format!("cannot draw an auth nonce: OS RNG failed: {e}")));
+    auth_nonce(latest_ledger, u32::from_le_bytes(entropy))
+}
+
+/// The transaction hash: SHA-256 over `network_id || ENVELOPE_TYPE_TX || tx`.
+/// It is what the agent signs and what the network reports the tx under.
+fn tx_hash(tx: &Transaction, network_id: &[u8; 32]) -> [u8; 32] {
+    let tx_xdr = tx.to_xdr(Limits::none()).expect("tx XDR");
+    let mut msg = Vec::with_capacity(36 + tx_xdr.len());
+    msg.extend_from_slice(network_id);
+    msg.extend_from_slice(&(EnvelopeType::Tx as i32).to_be_bytes());
+    msg.extend_from_slice(&tx_xdr);
+    Sha256::digest(&msg).into()
+}
+
 fn sign_envelope(
     env: &TransactionEnvelope,
     network_id: &[u8; 32],
@@ -894,12 +1143,7 @@ fn sign_envelope(
         other => panic!("unexpected envelope variant {other:?}"),
     };
     debug_assert!(signatures.is_empty());
-    let tx_xdr = tx.to_xdr(Limits::none()).expect("tx XDR");
-    let mut msg = Vec::with_capacity(36 + tx_xdr.len());
-    msg.extend_from_slice(network_id);
-    msg.extend_from_slice(&(EnvelopeType::Tx as i32).to_be_bytes());
-    msg.extend_from_slice(&tx_xdr);
-    let digest: [u8; 32] = Sha256::digest(&msg).into();
+    let digest = tx_hash(tx, network_id);
     let sig = agent.sign(&digest).to_bytes();
     let pubkey = agent.verifying_key().to_bytes();
     let mut hint = [0u8; 4];
@@ -1003,14 +1247,14 @@ fn run(call: &Call, args: &Args) -> RunOutcome {
     let latest = args.rpc.latest_ledger();
     let sig_exp = latest.saturating_add(10_000);
 
-    // Build the call and the guard's auth entry (agent-signed) once. The tx
-    // sequence doubles as the auth nonce (fresh per transaction, never
-    // reused), keeping the SAC's replay protection satisfied.
+    // Build the call and the guard's auth entry (agent-signed) once, so the
+    // simulated and the submitted transaction carry the same nonce. It is
+    // drawn per invocation, independent of the tx sequence (see `auth_nonce`).
     let invocation = call.invocation(guard);
     let auth = VecM::try_from(vec![build_auth_entry(
         guard,
         &invocation,
-        seq,
+        fresh_auth_nonce(latest),
         sig_exp,
         &network_id,
         &agent,
@@ -1134,9 +1378,9 @@ fn run(call: &Call, args: &Args) -> RunOutcome {
             data.resources.footprint.read_only.len(),
         );
     }
-    // Cover the extra write entries (~few hundred stroops each) plus headroom
-    // for `__check_auth`'s extra instructions, which the recording-mode
-    // preflight also under-prices.
+    // Cover the merged write entries plus `__check_auth` instruction headroom;
+    // the derivation and failure signature are documented at
+    // `GUARD_KEY_FEE_BUMP`.
     data.resources.footprint = merged;
     data.resource_fee = data
         .resource_fee
@@ -1182,7 +1426,25 @@ fn run(call: &Call, args: &Args) -> RunOutcome {
     if std::env::var_os("AGENT_TX_DEBUG").is_some() {
         eprintln!("envelope: {}", b64_encode_xdr(&env2));
     }
-    let sent = args.rpc.send(&b64_encode_xdr(&env2));
+    let sent = match args.rpc.send(&b64_encode_xdr(&env2)) {
+        Ok(sent) => sent,
+        Err(e) if e.is_timeout() => {
+            // The endpoint may have relayed the tx before stalling. Name the
+            // hash so the operator checks it before resubmitting.
+            let TransactionEnvelope::Tx(v1) = &env2 else {
+                unreachable!("sign_envelope builds a v1 envelope")
+            };
+            rpc_exit(
+                &e,
+                Some(format!(
+                    "The transaction may still have been accepted: check tx {} \
+                     (getTransaction) before resubmitting",
+                    hex::encode(tx_hash(&v1.tx, &network_id))
+                )),
+            )
+        }
+        Err(e) => rpc_exit(&e, None),
+    };
     if std::env::var_os("AGENT_TX_DEBUG").is_some() {
         eprintln!("send response: {sent}");
     }
@@ -1204,8 +1466,15 @@ fn run(call: &Call, args: &Args) -> RunOutcome {
 
     let mut outcome = None;
     for _ in 0..20 {
-        std::thread::sleep(std::time::Duration::from_secs(3));
-        let gt = args.rpc.get_tx(&hash);
+        std::thread::sleep(Duration::from_secs(3));
+        let gt = match args.rpc.get_tx(&hash) {
+            Ok(gt) => gt,
+            Err(e) if e.is_timeout() => {
+                eprintln!("{e}; still polling tx={hash}");
+                continue;
+            }
+            Err(e) => rpc_exit(&e, None),
+        };
         let st = gt["status"].as_str().unwrap_or("PENDING");
         if st == "SUCCESS" {
             println!("RESULT: ALLOWED tx={hash}");
@@ -1365,9 +1634,15 @@ fn cmd_guards_add(cli: &mut Cli) -> Result<(), String> {
     let mut network = None;
     let mut rpc_url = None;
     let mut passphrase = None;
+    let mut rpc_timeout = None;
     let mut positionals: Vec<String> = Vec::new();
     while let Some(token) = cli.next() {
         match token.as_str() {
+            "--rpc-timeout" => {
+                rpc_timeout = Some(parse_rpc_timeout(
+                    &cli.value_expected("--rpc-timeout", "whole seconds e.g. 30")?,
+                )?)
+            }
             "--help" | "-h" => {
                 print_guards_subcommand_help("add");
                 return Ok(());
@@ -1406,9 +1681,7 @@ fn cmd_guards_add(cli: &mut Cli) -> Result<(), String> {
             .or(positionals.get(1).map(String::as_str)),
     )?;
 
-    let rpc = Rpc {
-        url: endpoint.rpc_url,
-    };
+    let rpc = Rpc::new(endpoint.rpc_url, rpc_timeout.unwrap_or(DEFAULT_RPC_TIMEOUT));
     verify_guard(&rpc, &address, &endpoint.passphrase)?;
 
     let mut reg = load_registry();
@@ -1649,9 +1922,10 @@ mod tests {
     #[test]
     fn extract_dms_grace_secs_from_policy_map() {
         // Test that we can extract dms_grace_secs from a PolicyConfig map
+        // A single dms_grace_secs (u64) field: a 1 hour grace period.
         let policy_map_entries = vec![ScMapEntry {
             key: ScVal::Symbol(ScSymbol("dms_grace_secs".try_into().unwrap())),
-            val: ScVal::U64(3600), // 1 hour grace period
+            val: ScVal::U64(3600),
         }];
 
         let policy_map = ScMap(stellar_xdr::VecM::try_from(policy_map_entries).unwrap());
@@ -1778,6 +2052,110 @@ mod tests {
         }
     }
 
+    // ── Guard storage keys vs the contract's DataKey (issue #383) ────────
+
+    /// Generated by the contract's `agent_tx_storage_keys_fixture_is_current`
+    /// test from the real `DataKey` encoding.
+    const CONTRACT_STORAGE_KEYS: &str = include_str!("../guard-storage-keys.json");
+
+    #[test]
+    fn guard_footprint_declares_exactly_the_check_auth_read_set() {
+        let names: Vec<&str> = GuardKey::CHECK_AUTH_READS
+            .iter()
+            .map(|k| k.variant())
+            .collect();
+        assert_eq!(names, ["Policy", "Window", "LastHeartbeat", "AdminFrozen"]);
+
+        // The footprint table declares exactly those keys plus the instance.
+        let guard: ScAddress = VALID_GUARD.parse().unwrap();
+        let declared: Vec<StorageTarget> = GUARD_STORAGE_TOUCHES.iter().map(|t| t.target).collect();
+        let expected: Vec<StorageTarget> = GuardKey::CHECK_AUTH_READS
+            .iter()
+            .map(|&k| StorageTarget::Persistent(k))
+            .chain([StorageTarget::Instance])
+            .collect();
+        assert_eq!(declared.len(), expected.len());
+        for target in &expected {
+            assert!(
+                declared.contains(target),
+                "{target:?} missing from footprint"
+            );
+        }
+
+        for kind in [CallKind::Transfer, CallKind::Heartbeat, CallKind::ReadOnly] {
+            let fp = guard_footprint(&guard, kind);
+            // Merging into a footprint that already holds the keys adds nothing.
+            assert_eq!(merge_guard_footprint(fp.clone(), &guard, kind), fp);
+        }
+
+        // Keys the simulation declared read-only stay read-only, never
+        // duplicated into read-write.
+        let policy = guard_data_key(&guard, GuardKey::Policy);
+        let sim = LedgerFootprint {
+            read_only: VecM::try_from(vec![policy.clone()]).unwrap(),
+            read_write: VecM::default(),
+        };
+        let merged = merge_guard_footprint(sim, &guard, CallKind::Transfer);
+        assert_eq!(merged.read_only.iter().filter(|k| **k == policy).count(), 1);
+        assert!(!merged.read_write.contains(&policy));
+    }
+
+    #[test]
+    fn guard_storage_keys_match_the_contracts_datakey_encoding() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(CONTRACT_STORAGE_KEYS).expect("guard-storage-keys.json parses");
+        let entries = fixture["keys"].as_array().expect("keys array");
+        for key in GuardKey::CHECK_AUTH_READS {
+            let entry = entries
+                .iter()
+                .find(|e| e["variant"] == key.variant())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "DataKey::{} no longer exists in the contract (src/types.rs); agent-tx \
+                         would declare a footprint key the guard never reads. Update GuardKey.",
+                        key.variant()
+                    )
+                });
+            assert_eq!(
+                entry["storage"],
+                "persistent",
+                "DataKey::{} moved out of persistent storage; agent-tx declares it persistent",
+                key.variant()
+            );
+            assert_eq!(
+                hex::encode(key.scval().to_xdr(Limits::none()).unwrap()),
+                entry["scval_xdr_hex"].as_str().expect("hex string"),
+                "agent-tx encodes DataKey::{} differently from the contract",
+                key.variant()
+            );
+        }
+    }
+
+    // ── Guard-key fee allowance (issue #382) ─────────────────────────────
+
+    #[test]
+    fn guard_key_fee_allowance_covers_its_derivation() {
+        // The figure the documentation quotes.
+        assert_eq!(GUARD_FOOTPRINT_KEYS, 5);
+        assert_eq!(guard_key_fee_floor(), 22_291);
+        assert!(guard_key_fee_floor() <= i64::from(GUARD_KEY_FEE_BUMP));
+
+        // The per-key byte bound holds for the keys actually declared.
+        let guard: ScAddress = VALID_GUARD.parse().unwrap();
+        let fp = guard_footprint(&guard, CallKind::Transfer);
+        let keys: Vec<LedgerKey> = fp
+            .read_only
+            .iter()
+            .chain(fp.read_write.iter())
+            .cloned()
+            .collect();
+        assert_eq!(keys.len() as i64, GUARD_FOOTPRINT_KEYS);
+        for key in keys {
+            let len = key.to_xdr(Limits::none()).unwrap().len() as i64;
+            assert!(len <= GUARD_KEY_XDR_BYTES_MAX, "{key:?} is {len} bytes");
+        }
+    }
+
     #[test]
     fn transfer_from_invocation_uses_exact_contract_argument_order() {
         let guard: ScAddress = VALID_GUARD.parse().unwrap();
@@ -1812,6 +2190,8 @@ mod tests {
         sequence_reads: std::cell::Cell<u32>,
         simulations: std::cell::Cell<u32>,
         response: serde_json::Value,
+        ledger: std::cell::Cell<u32>,
+        envelopes: std::cell::RefCell<Vec<String>>,
     }
 
     impl PreflightRpc for MockPreflightRpc {
@@ -1821,11 +2201,12 @@ mod tests {
         }
 
         fn latest_ledger(&self) -> u32 {
-            100
+            self.ledger.get()
         }
 
-        fn simulate(&self, _envelope: &str) -> serde_json::Value {
+        fn simulate(&self, envelope: &str) -> serde_json::Value {
             self.simulations.set(self.simulations.get() + 1);
+            self.envelopes.borrow_mut().push(envelope.to_string());
             self.response.clone()
         }
 
@@ -1847,7 +2228,7 @@ mod tests {
             ..Default::default()
         };
         let args = Args {
-            rpc: Rpc { url: String::new() },
+            rpc: Rpc::new(String::new(), DEFAULT_RPC_TIMEOUT),
             passphrase: Network::Testnet.passphrase().to_string(),
             passphrase_source: "default testnet preset",
             guard: "CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7"
@@ -1878,7 +2259,7 @@ mod tests {
             ..Default::default()
         };
         let args = Args {
-            rpc: Rpc { url: String::new() },
+            rpc: Rpc::new(String::new(), DEFAULT_RPC_TIMEOUT),
             passphrase: Network::Testnet.passphrase().to_string(),
             passphrase_source: "default testnet preset",
             guard: "CAYJZT4XH5SWDXNR7MZJCCUBIDAT2KZDDUTZ7OZQEMKCPJGD4P3X4CU7"
@@ -1895,6 +2276,201 @@ mod tests {
         assert_eq!(rpc.sequence.get(), 7);
     }
 
+    // ── RPC timeout (issue #385) ─────────────────────────────────────────
+
+    /// A loopback endpoint that accepts connections, optionally writes
+    /// `preamble`, and then never answers — a black-holed RPC.
+    fn hung_endpoint(preamble: &'static [u8]) -> String {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback bind");
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for _ in 0..4 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let _ = stream.write_all(preamble);
+                let _ = stream.flush();
+                held.push(stream); // keep it open, never respond
+            }
+            std::thread::sleep(Duration::from_secs(30));
+        });
+        url
+    }
+
+    #[test]
+    fn a_hung_endpoint_times_out_with_an_error_naming_the_method() {
+        let rpc = Rpc::new(hung_endpoint(b""), Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        let err = rpc
+            .post("getLatestLedger", serde_json::json!({}))
+            .expect_err("a silent endpoint must not produce a result");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "bounded by the timeout"
+        );
+        assert!(err.is_timeout(), "{err:?}");
+        assert_eq!(err.method, "getLatestLedger");
+        assert_eq!(err.label(), "RPC TIMEOUT");
+        assert_eq!(err.exit_code(), 3);
+        let message = err.to_string();
+        assert!(message.contains("getLatestLedger"), "{message}");
+        assert!(message.contains("no response"), "{message}");
+        assert!(message.contains("--rpc-timeout"), "{message}");
+    }
+
+    #[test]
+    fn a_stall_after_the_headers_is_also_a_timeout() {
+        let preamble =
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{";
+        let rpc = Rpc::new(hung_endpoint(preamble), Duration::from_millis(300));
+        let err = rpc
+            .post("simulateTransaction", serde_json::json!({}))
+            .expect_err("a truncated body must not produce a result");
+        assert!(err.is_timeout(), "{err:?}");
+        assert_eq!(err.method, "simulateTransaction");
+    }
+
+    #[test]
+    fn a_refused_connection_is_a_transport_error_not_a_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback bind");
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        drop(listener);
+        let err = Rpc::new(url, Duration::from_secs(5))
+            .post("getLatestLedger", serde_json::json!({}))
+            .expect_err("nothing is listening");
+        assert_eq!(err.kind, RpcFailureKind::Transport, "{err:?}");
+        assert!(!err.is_timeout());
+    }
+
+    #[test]
+    fn a_responsive_endpoint_is_unaffected_by_the_timeout() {
+        let mock = MockRpc::start();
+        let result = Rpc::new(mock.url.clone(), Duration::from_secs(5))
+            .post("getLatestLedger", serde_json::json!({}))
+            .expect("mock answers");
+        assert_eq!(result["sequence"], 1);
+    }
+
+    #[test]
+    fn rpc_timeout_flag_sets_the_request_timeout() {
+        let args = argv(&["--guard", VALID_GUARD]);
+        let request = parse_request("status", &args).expect("default");
+        assert_eq!(request.rpc_timeout, DEFAULT_RPC_TIMEOUT);
+
+        let args = argv(&["--guard", VALID_GUARD, "--rpc-timeout", "5"]);
+        let request = parse_request("status", &args).expect("explicit timeout");
+        assert_eq!(request.rpc_timeout, Duration::from_secs(5));
+        assert_eq!(request.rpc().timeout, Duration::from_secs(5));
+
+        for bad in ["0", "-1", "1.5", "soon"] {
+            let args = argv(&["--guard", VALID_GUARD, "--rpc-timeout", bad]);
+            let err = parse_request("status", &args).expect_err(bad);
+            assert!(err.contains("invalid --rpc-timeout"), "{err}");
+        }
+    }
+
+    // ── Guard auth nonce (issue #384) ────────────────────────────────────
+
+    /// The nonce of the guard auth entry in each envelope the mock simulated.
+    fn simulated_nonces(rpc: &MockPreflightRpc) -> Vec<i64> {
+        rpc.envelopes
+            .borrow()
+            .iter()
+            .map(|b64| {
+                let TransactionEnvelope::Tx(env) = xdr::<TransactionEnvelope>(b64) else {
+                    panic!("unexpected envelope variant");
+                };
+                let OperationBody::InvokeHostFunction(op) = &env.tx.operations[0].body else {
+                    panic!("not an invoke operation");
+                };
+                let SorobanCredentials::Address(creds) = &op.auth[0].credentials else {
+                    panic!("guard auth entry missing");
+                };
+                creds.nonce
+            })
+            .collect()
+    }
+
+    fn signed_preflight_args() -> Args {
+        Args {
+            rpc: Rpc::new(String::new(), DEFAULT_RPC_TIMEOUT),
+            passphrase: Network::Testnet.passphrase().to_string(),
+            passphrase_source: "default testnet preset",
+            guard: VALID_GUARD.parse().unwrap(),
+            secret: Some(VALID_SECRET.to_string()),
+            expect_blocked: false,
+            inclusion_fee_override: None,
+        }
+    }
+
+    #[test]
+    fn auth_nonce_is_the_ledger_over_the_entropy() {
+        let nonce = auth_nonce(65_008_194, 0xdead_beef);
+        assert_eq!((nonce as u64) >> 32, 65_008_194);
+        assert_eq!(nonce as u64 & 0xffff_ffff, 0xdead_beef);
+        // Injective: any change to either half changes the nonce.
+        assert_ne!(auth_nonce(7, 1), auth_nonce(7, 2));
+        assert_ne!(auth_nonce(7, 1), auth_nonce(8, 1));
+        // Past ledger 2^31 the bit pattern wraps negative but stays distinct.
+        assert_ne!(auth_nonce(u32::MAX, 0), auth_nonce(u32::MAX - 1, 0));
+    }
+
+    #[test]
+    fn two_submissions_in_the_same_ledger_get_distinct_nonces() {
+        let rpc = MockPreflightRpc {
+            sequence: std::cell::Cell::new(7),
+            ledger: std::cell::Cell::new(5_000),
+            response: serde_json::json!({ "minResourceFee": "200" }),
+            ..Default::default()
+        };
+        let args = signed_preflight_args();
+        preflight(&Call::Heartbeat, &args, &rpc).unwrap();
+        preflight(&Call::Heartbeat, &args, &rpc).unwrap();
+
+        let nonces = simulated_nonces(&rpc);
+        assert_eq!(nonces.len(), 2);
+        // Fails with probability 2^-32: two equal 32-bit draws.
+        assert_ne!(nonces[0], nonces[1], "same-ledger nonces collided");
+        for nonce in nonces {
+            assert_eq!((nonce as u64) >> 32, 5_000, "ledger is the high half");
+        }
+    }
+
+    #[test]
+    fn a_retry_after_a_failed_attempt_draws_a_fresh_nonce() {
+        // Attempt one is blocked/fails before its sequence is consumed, so the
+        // retry runs at the *same* sequence (7 -> 8). Under the old scheme the
+        // nonce was that sequence, so both attempts carried nonce 8.
+        let rpc = MockPreflightRpc {
+            sequence: std::cell::Cell::new(7),
+            ledger: std::cell::Cell::new(5_000),
+            response: serde_json::json!({
+                "error": { "code": "simulation", "message": "failed", "data": {} }
+            }),
+            ..Default::default()
+        };
+        let args = signed_preflight_args();
+        assert_eq!(preflight(&Call::Heartbeat, &args, &rpc), Err(1));
+        assert_eq!(rpc.sequence.get(), 7, "the failed attempt consumed nothing");
+
+        // The retry lands a ledger later at the same sequence.
+        rpc.ledger.set(5_001);
+        assert_eq!(preflight(&Call::Heartbeat, &args, &rpc), Err(1));
+
+        let nonces = simulated_nonces(&rpc);
+        assert_eq!(nonces.len(), 2);
+        assert_ne!(nonces[0], nonces[1]);
+        assert!(
+            nonces.iter().all(|&n| n != 8),
+            "nonce must not be the sequence"
+        );
+        // Different ledgers: disjoint high halves, so no collision is possible.
+        assert_eq!((nonces[0] as u64) >> 32, 5_000);
+        assert_eq!((nonces[1] as u64) >> 32, 5_001);
+    }
+
     #[test]
     fn expect_blocked_only_accepts_guard_auth_checked_blocks() {
         let guard: ScAddress = VALID_GUARD.parse().unwrap();
@@ -1907,7 +2483,7 @@ mod tests {
             ..Default::default()
         };
         let args = Args {
-            rpc: Rpc { url: String::new() },
+            rpc: Rpc::new(String::new(), DEFAULT_RPC_TIMEOUT),
             passphrase: Network::Testnet.passphrase().to_string(),
             passphrase_source: "default testnet preset",
             guard,
@@ -2661,14 +3237,14 @@ mod tests {
 
         // Transfer writes Window and Instance key (engine TTL)
         assert_eq!(rw_keys.len(), 2);
-        assert!(rw_keys.contains(&guard_data_key(&guard, "Window")));
+        assert!(rw_keys.contains(&guard_data_key(&guard, GuardKey::Window)));
         assert!(rw_keys.contains(&guard_instance_key(&guard)));
 
         // Transfer only reads Policy, AdminFrozen, and LastHeartbeat
         assert_eq!(ro_keys.len(), 3);
-        assert!(ro_keys.contains(&guard_data_key(&guard, "Policy")));
-        assert!(ro_keys.contains(&guard_data_key(&guard, "AdminFrozen")));
-        assert!(ro_keys.contains(&guard_data_key(&guard, "LastHeartbeat")));
+        assert!(ro_keys.contains(&guard_data_key(&guard, GuardKey::Policy)));
+        assert!(ro_keys.contains(&guard_data_key(&guard, GuardKey::AdminFrozen)));
+        assert!(ro_keys.contains(&guard_data_key(&guard, GuardKey::LastHeartbeat)));
 
         // Read-only and read-write sets must be disjoint
         for key in &ro_keys {
@@ -2689,14 +3265,14 @@ mod tests {
 
         // Heartbeat writes LastHeartbeat and Instance key (engine TTL)
         assert_eq!(rw_keys.len(), 2);
-        assert!(rw_keys.contains(&guard_data_key(&guard, "LastHeartbeat")));
+        assert!(rw_keys.contains(&guard_data_key(&guard, GuardKey::LastHeartbeat)));
         assert!(rw_keys.contains(&guard_instance_key(&guard)));
 
         // Heartbeat only reads Policy, AdminFrozen, and Window
         assert_eq!(ro_keys.len(), 3);
-        assert!(ro_keys.contains(&guard_data_key(&guard, "Policy")));
-        assert!(ro_keys.contains(&guard_data_key(&guard, "AdminFrozen")));
-        assert!(ro_keys.contains(&guard_data_key(&guard, "Window")));
+        assert!(ro_keys.contains(&guard_data_key(&guard, GuardKey::Policy)));
+        assert!(ro_keys.contains(&guard_data_key(&guard, GuardKey::AdminFrozen)));
+        assert!(ro_keys.contains(&guard_data_key(&guard, GuardKey::Window)));
 
         // Read-only and read-write sets must be disjoint
         for key in &ro_keys {
@@ -2721,10 +3297,10 @@ mod tests {
 
         // All persistent keys are in read-only
         assert_eq!(ro_keys.len(), 4);
-        assert!(ro_keys.contains(&guard_data_key(&guard, "Policy")));
-        assert!(ro_keys.contains(&guard_data_key(&guard, "AdminFrozen")));
-        assert!(ro_keys.contains(&guard_data_key(&guard, "Window")));
-        assert!(ro_keys.contains(&guard_data_key(&guard, "LastHeartbeat")));
+        assert!(ro_keys.contains(&guard_data_key(&guard, GuardKey::Policy)));
+        assert!(ro_keys.contains(&guard_data_key(&guard, GuardKey::AdminFrozen)));
+        assert!(ro_keys.contains(&guard_data_key(&guard, GuardKey::Window)));
+        assert!(ro_keys.contains(&guard_data_key(&guard, GuardKey::LastHeartbeat)));
     }
 
     #[test]
@@ -2741,24 +3317,28 @@ mod tests {
         assert_eq!(transfer_merged.read_only.len(), 3);
         assert!(transfer_merged
             .read_write
-            .contains(&guard_data_key(&guard, "Window")));
+            .contains(&guard_data_key(&guard, GuardKey::Window)));
         assert!(transfer_merged
             .read_only
-            .contains(&guard_data_key(&guard, "LastHeartbeat")));
+            .contains(&guard_data_key(&guard, GuardKey::LastHeartbeat)));
 
         let heartbeat_merged = merge_guard_footprint(empty_fp, &guard, CallKind::Heartbeat);
         assert_eq!(heartbeat_merged.read_write.len(), 2);
         assert_eq!(heartbeat_merged.read_only.len(), 3);
         assert!(heartbeat_merged
             .read_write
-            .contains(&guard_data_key(&guard, "LastHeartbeat")));
+            .contains(&guard_data_key(&guard, GuardKey::LastHeartbeat)));
         assert!(heartbeat_merged
             .read_only
-            .contains(&guard_data_key(&guard, "Window")));
+            .contains(&guard_data_key(&guard, GuardKey::Window)));
 
         // Merge onto simulated footprint that already has token contract keys
         let token_addr: ScAddress = VALID_TOKEN.parse().expect("valid token");
-        let token_rw = guard_data_key(&token_addr, "Balance");
+        let token_rw = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: token_addr,
+            key: ScVal::Symbol(ScSymbol("Balance".try_into().unwrap())),
+            durability: ContractDataDurability::Persistent,
+        });
         let simulated_fp = LedgerFootprint {
             read_only: VecM::default(),
             read_write: VecM::try_from(vec![token_rw.clone()]).expect("bound"),
@@ -2768,7 +3348,7 @@ mod tests {
         assert!(merged.read_write.contains(&token_rw));
         assert!(merged
             .read_write
-            .contains(&guard_data_key(&guard, "Window")));
+            .contains(&guard_data_key(&guard, GuardKey::Window)));
         assert_eq!(merged.read_write.len(), 3); // token_rw + Window + Instance
         assert_eq!(merged.read_only.len(), 3); // Policy + AdminFrozen + LastHeartbeat
     }
@@ -3011,6 +3591,7 @@ fn valid_flags_for_subcommand(cmd: &str) -> &'static [&'static str] {
             "--agent-secret",
             "--network",
             "--rpc-url",
+            "--rpc-timeout",
             "--network-passphrase",
             "--inclusion-fee",
             "--expect-blocked",
@@ -3027,6 +3608,7 @@ fn valid_flags_for_subcommand(cmd: &str) -> &'static [&'static str] {
             "--secret",
             "--network",
             "--rpc-url",
+            "--rpc-timeout",
             "--network-passphrase",
             "--inclusion-fee",
             "--expect-blocked",
@@ -3044,6 +3626,7 @@ fn valid_flags_for_subcommand(cmd: &str) -> &'static [&'static str] {
             "--secret",
             "--network",
             "--rpc-url",
+            "--rpc-timeout",
             "--network-passphrase",
             "--inclusion-fee",
             "--expect-blocked",
@@ -3056,6 +3639,7 @@ fn valid_flags_for_subcommand(cmd: &str) -> &'static [&'static str] {
             "--secret",
             "--network",
             "--rpc-url",
+            "--rpc-timeout",
             "--network-passphrase",
             "--inclusion-fee",
             "-h",
@@ -3065,6 +3649,7 @@ fn valid_flags_for_subcommand(cmd: &str) -> &'static [&'static str] {
             "--guard",
             "--network",
             "--rpc-url",
+            "--rpc-timeout",
             "--network-passphrase",
             "-h",
             "--help",
@@ -3077,6 +3662,7 @@ fn valid_flags_for_subcommand(cmd: &str) -> &'static [&'static str] {
             "--amount",
             "--network",
             "--rpc-url",
+            "--rpc-timeout",
             "--network-passphrase",
             "-h",
             "--help",
@@ -3150,6 +3736,15 @@ fn validate_address(field: &str, kind: KeyKind, value: &str) -> Result<ScAddress
     })
 }
 
+fn parse_rpc_timeout(raw: &str) -> Result<Duration, String> {
+    match raw.parse::<u64>() {
+        Ok(secs) if secs > 0 => Ok(Duration::from_secs(secs)),
+        _ => Err(format!(
+            "invalid --rpc-timeout '{raw}': expected a whole number of seconds greater than 0"
+        )),
+    }
+}
+
 fn parse_amount(raw: &str) -> Result<i128, String> {
     raw.parse::<i128>().map_err(|e| {
         format!("invalid --amount '{raw}': {e}; expected an integer i128 in whole units")
@@ -3168,6 +3763,7 @@ struct Request {
     amount: Option<i128>,
     secret: Option<String>,
     endpoint: Endpoint,
+    rpc_timeout: Duration,
     expect_blocked: bool,
     inclusion_fee_override: Option<u32>,
 }
@@ -3180,9 +3776,7 @@ impl Request {
     }
 
     fn rpc(&self) -> Rpc {
-        Rpc {
-            url: self.endpoint.rpc_url.clone(),
-        }
+        Rpc::new(self.endpoint.rpc_url.clone(), self.rpc_timeout)
     }
 
     fn args(&self) -> Args {
@@ -3212,6 +3806,7 @@ fn parse_request(cmd: &str, argv: &[String]) -> Result<Request, String> {
     let mut network = None;
     let mut rpc_url = None;
     let mut passphrase = None;
+    let mut rpc_timeout = DEFAULT_RPC_TIMEOUT;
     let mut expect_blocked = false;
     let mut inclusion_fee_override = None;
 
@@ -3279,6 +3874,11 @@ fn parse_request(cmd: &str, argv: &[String]) -> Result<Request, String> {
             }
             "--network-passphrase" => {
                 passphrase = Some(cli.value_expected("--network-passphrase", "passphrase string")?)
+            }
+            "--rpc-timeout" => {
+                rpc_timeout = parse_rpc_timeout(
+                    &cli.value_expected("--rpc-timeout", "whole seconds e.g. 30")?,
+                )?
             }
             "--expect-blocked" => expect_blocked = true,
             other => return Err(cli.unknown(other)),
@@ -3363,6 +3963,7 @@ fn parse_request(cmd: &str, argv: &[String]) -> Result<Request, String> {
         amount,
         secret,
         endpoint,
+        rpc_timeout,
         expect_blocked,
         inclusion_fee_override,
     })
@@ -3393,6 +3994,8 @@ fn tool_help() -> String {
          \x20 --network-passphrase <passphrase>     override the preset's passphrase (advanced:\n\
          \x20                                       private or non-standard networks)\n\
          \x20 --inclusion-fee <stroops>             override the RPC-reported inclusion fee\n\
+         \x20 --rpc-timeout <secs>                  per-request RPC timeout (default: {}s); a\n\
+         \x20                                       timeout exits 3 naming the RPC method\n\
          \x20 Custom --rpc-url values require --network-passphrase unless the URL is a known preset.\n\
          \x20 Selecting mainnet prints the unaudited-contract reminder from SECURITY.md to stderr.\n\
          \x20 A StrKey's leading character encodes the key type, not the network, so address\n\
@@ -3406,7 +4009,8 @@ fn tool_help() -> String {
          Troubleshooting: See README.md 'Troubleshooting — Submission Errors' table for error mapping and concrete fix flags (--fee-multiplier, etc.).\n\
          The stellar CLI cannot sign auth entries for contract addresses; use agent-tx for heartbeat calls (see tools/agent-tx/README.md).",
         Network::Mainnet.rpc_url(),
-        Network::Futurenet.rpc_url()
+        Network::Futurenet.rpc_url(),
+        DEFAULT_RPC_TIMEOUT.as_secs()
     )
 }
 
@@ -3433,6 +4037,7 @@ fn subcommand_help(cmd: &str) -> String {
              \x20 --network <preset>          Network preset: testnet | futurenet | mainnet (default: testnet)\n\
              \x20 --rpc-url <url>             Custom RPC endpoint URL\n\
              \x20 --network-passphrase <pass> Custom network passphrase\n\
+             \x20 --rpc-timeout <secs>        Per-request RPC timeout in seconds (default 30)\n\
              \x20 --inclusion-fee <stroops>   Override inclusion fee in stroops (u32)\n\
              \x20 --expect-blocked            Invert exit code: exit 0 if simulation blocked, 1 if admitted\n\
              \x20 -h, --help                  Print this help message\n".to_string()
@@ -3453,6 +4058,7 @@ fn subcommand_help(cmd: &str) -> String {
              \x20 --network <preset>          Network preset: testnet | futurenet | mainnet (default: testnet)\n\
              \x20 --rpc-url <url>             Custom RPC endpoint URL\n\
              \x20 --network-passphrase <pass> Custom network passphrase\n\
+             \x20 --rpc-timeout <secs>        Per-request RPC timeout in seconds (default 30)\n\
              \x20 --inclusion-fee <stroops>   Override inclusion fee in stroops (u32)\n\
              \x20 --expect-blocked            Expect the transaction to be rejected by policy\n\
              \x20 -h, --help                  Print this help message\n".to_string()
@@ -3474,6 +4080,7 @@ fn subcommand_help(cmd: &str) -> String {
              \x20 --network <preset>          Network preset: testnet | futurenet | mainnet (default: testnet)\n\
              \x20 --rpc-url <url>             Custom RPC endpoint URL\n\
              \x20 --network-passphrase <pass> Custom network passphrase\n\
+             \x20 --rpc-timeout <secs>        Per-request RPC timeout in seconds (default 30)\n\
              \x20 --inclusion-fee <stroops>   Override inclusion fee in stroops (u32)\n\
              \x20 --expect-blocked            Expect the transaction to be rejected by policy\n\
              \x20 -h, --help                  Print this help message\n".to_string()
@@ -3491,6 +4098,7 @@ fn subcommand_help(cmd: &str) -> String {
              \x20 --network <preset>          Network preset: testnet | futurenet | mainnet (default: testnet)\n\
              \x20 --rpc-url <url>             Custom RPC endpoint URL\n\
              \x20 --network-passphrase <pass> Custom network passphrase\n\
+             \x20 --rpc-timeout <secs>        Per-request RPC timeout in seconds (default 30)\n\
              \x20 --inclusion-fee <stroops>   Override inclusion fee in stroops (u32)\n\
              \x20 -h, --help                  Print this help message\n".to_string()
         }
@@ -3506,6 +4114,7 @@ fn subcommand_help(cmd: &str) -> String {
              \x20 --network <preset>          Network preset: testnet | futurenet | mainnet (default: testnet)\n\
              \x20 --rpc-url <url>             Custom RPC endpoint URL\n\
              \x20 --network-passphrase <pass> Custom network passphrase\n\
+             \x20 --rpc-timeout <secs>        Per-request RPC timeout in seconds (default 30)\n\
              \x20 -h, --help                  Print this help message\n".to_string()
         }
         "policy" => {
@@ -3520,6 +4129,7 @@ fn subcommand_help(cmd: &str) -> String {
              \x20 --network <preset>          Network preset: testnet | futurenet | mainnet (default: testnet)\n\
              \x20 --rpc-url <url>             Custom RPC endpoint URL\n\
              \x20 --network-passphrase <pass> Custom network passphrase\n\
+             \x20 --rpc-timeout <secs>        Per-request RPC timeout in seconds (default 30)\n\
              \x20 -h, --help                  Print this help message\n".to_string()
         }
         "check" => {
@@ -3537,6 +4147,7 @@ fn subcommand_help(cmd: &str) -> String {
              \x20 --network <preset>          Network preset: testnet | futurenet | mainnet (default: testnet)\n\
              \x20 --rpc-url <url>             Custom RPC endpoint URL\n\
              \x20 --network-passphrase <pass> Custom network passphrase\n\
+             \x20 --rpc-timeout <secs>        Per-request RPC timeout in seconds (default 30)\n\
              \x20 -h, --help                  Print this help message\n".to_string()
         }
         "guards" => guards_help(),
@@ -3554,7 +4165,7 @@ fn guards_help() -> String {
      Manage the local registry of guard contracts and aliases.\n\
      \n\
      Subcommands:\n\
-     \x20 add <alias> <address> <admin> [--network <name> | --rpc-url <url>] [--network-passphrase <pass>]\n\
+     \x20 add <alias> <address> <admin> [--network <name> | --rpc-url <url>] [--network-passphrase <pass>] [--rpc-timeout <secs>]\n\
      \x20     Register a guard contract address and admin under an alias\n\
      \x20 list\n\
      \x20     List all registered guard aliases and current default\n\
@@ -3587,6 +4198,7 @@ fn guards_subcommand_help(sub: &str) -> String {
              \x20 --network <preset>          Network preset: testnet | futurenet | mainnet\n\
              \x20 --rpc-url <url>             Custom RPC endpoint URL\n\
              \x20 --network-passphrase <pass> Custom network passphrase\n\
+             \x20 --rpc-timeout <secs>        Per-request RPC timeout in seconds (default 30)\n\
              \x20 -h, --help                  Print this help message\n"
             .to_string(),
         "list" => "Usage: agent-tx guards list\n\
@@ -3648,9 +4260,9 @@ fn cmd_status(rpc: &Rpc, guard: &ScAddress, _passphrase: &str) -> Result<(), Str
     // Fetch instance storage: Initialized, Admin, AgentPubkey (instance keys)
     // and persistent storage: Policy, LastHeartbeat, AdminFrozen, PolicyRevision
     let instance_key = guard_instance_key(guard);
-    let policy_key = guard_data_key(guard, "Policy");
-    let heartbeat_key = guard_data_key(guard, "LastHeartbeat");
-    let frozen_key = guard_data_key(guard, "AdminFrozen");
+    let policy_key = guard_data_key(guard, GuardKey::Policy);
+    let heartbeat_key = guard_data_key(guard, GuardKey::LastHeartbeat);
+    let frozen_key = guard_data_key(guard, GuardKey::AdminFrozen);
 
     let keys = [instance_key, policy_key, heartbeat_key, frozen_key];
     let keys_xdr: Vec<String> = keys.iter().map(b64_encode_xdr).collect();
@@ -3668,22 +4280,15 @@ fn cmd_status(rpc: &Rpc, guard: &ScAddress, _passphrase: &str) -> Result<(), Str
         let le: LedgerEntryData = xdr(entry_xdr);
 
         if let LedgerEntryData::ContractData(cdata) = le {
-            if let ScVal::Symbol(sym) = &cdata.key {
-                match sym.0.as_slice() {
-                    b"Policy" => {
-                        has_policy = !matches!(cdata.val, ScVal::Void);
-                    }
-                    b"AdminFrozen" => {
-                        if let ScVal::Bool(frozen) = cdata.val {
-                            admin_frozen = frozen;
-                        }
-                    }
-                    b"LastHeartbeat" => {
-                        if let ScVal::U64(ts) = cdata.val {
-                            last_heartbeat = ts;
-                        }
-                    }
-                    _ => {}
+            if cdata.key == GuardKey::Policy.scval() {
+                has_policy = !matches!(cdata.val, ScVal::Void);
+            } else if cdata.key == GuardKey::AdminFrozen.scval() {
+                if let ScVal::Bool(frozen) = cdata.val {
+                    admin_frozen = frozen;
+                }
+            } else if cdata.key == GuardKey::LastHeartbeat.scval() {
+                if let ScVal::U64(ts) = cdata.val {
+                    last_heartbeat = ts;
                 }
             }
         }
@@ -3701,26 +4306,23 @@ fn cmd_status(rpc: &Rpc, guard: &ScAddress, _passphrase: &str) -> Result<(), Str
             let le: LedgerEntryData = xdr(entry_xdr);
 
             if let LedgerEntryData::ContractData(cdata) = le {
-                if let ScVal::Symbol(sym) = &cdata.key {
-                    if sym.0.as_slice() == b"Policy" {
-                        // PolicyConfig is stored as a Map with Symbol keys
-                        let dms_grace_secs = extract_dms_grace_secs(&cdata.val);
+                if cdata.key == GuardKey::Policy.scval() {
+                    // PolicyConfig is stored as a Map with Symbol keys
+                    let dms_grace_secs = extract_dms_grace_secs(&cdata.val);
 
-                        // Heartbeat expired if: (now - last_heartbeat) > dms_grace_secs
-                        // OR if dms_grace_secs is enabled (> 0) and last_heartbeat is 0 (never heartbeated)
-                        if dms_grace_secs > 0 {
-                            if last_heartbeat == 0 {
-                                // Never heartbeated: expired immediately when DMS is enabled
-                                heartbeat_expired = true;
-                            } else {
-                                // Check if grace period has elapsed
-                                heartbeat_expired = now.saturating_sub(last_heartbeat as u32)
-                                    as u64
-                                    > dms_grace_secs;
-                            }
+                    // Heartbeat expired if: (now - last_heartbeat) > dms_grace_secs
+                    // OR if dms_grace_secs is enabled (> 0) and last_heartbeat is 0 (never heartbeated)
+                    if dms_grace_secs > 0 {
+                        if last_heartbeat == 0 {
+                            // Never heartbeated: expired immediately when DMS is enabled
+                            heartbeat_expired = true;
+                        } else {
+                            // Check if grace period has elapsed
+                            heartbeat_expired =
+                                now.saturating_sub(last_heartbeat as u32) as u64 > dms_grace_secs;
                         }
-                        break;
                     }
+                    break;
                 }
             }
         }
@@ -3739,7 +4341,7 @@ fn cmd_status(rpc: &Rpc, guard: &ScAddress, _passphrase: &str) -> Result<(), Str
 
 /// Fetch and display the current policy configuration
 fn cmd_policy(rpc: &Rpc, guard: &ScAddress, _passphrase: &str) -> Result<(), String> {
-    let policy_key = guard_data_key(guard, "Policy");
+    let policy_key = guard_data_key(guard, GuardKey::Policy);
     let res = rpc_or_exit(rpc.post(
         "getLedgerEntries",
         serde_json::json!({ "keys": [b64_encode_xdr(&policy_key)] }),
