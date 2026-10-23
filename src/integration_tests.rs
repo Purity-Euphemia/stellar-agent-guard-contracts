@@ -91,6 +91,7 @@
 //! | | `Harness::base_policy()` | Returns a standard baseline policy with `MockAsset` and allowed recipient `h.recv`. |
 //! | | `h.install_policy(&cfg)` | Installs policy in mock mode. |
 //! | | `h.set_policy_enforcing(&cfg)` | Updates policy when already in enforcing mode. |
+//! | | `Harness::new_enforced_auth()` | Fresh registration under *real* host auth: `initialize` runs with an explicit admin entry and no `mock_all_auths()` call. |
 //! | **Invocations** | `h.transfer_invocation(from, to, amount)` | Constructs `SorobanAuthorizedInvocation` for `MockAsset::transfer`. |
 //! | | `h.heartbeat_invocation()` | Constructs invocation for `heartbeat()`. |
 //! | | `h.invocation(contract, fn, args)` | Low-level invocation builder for arbitrary contracts/methods. |
@@ -524,11 +525,12 @@ impl Harness {
         let other = Address::generate(&env);
 
         // soroban-sdk 27 test env defaults to *enforcing* auth: `require_auth`
-        // only passes with explicit entries. Admin setup ops (initialize,
-        // set_policy, ...) run under blanket mocking; `enforce()` flips the env
-        // back into enforcing mode with a hand-signed entry for the guarded
-        // flow. `mock_all_auths` is the documented default intent of the
-        // harness (see header comment).
+        // only passes with explicit entries. The default harness intentionally
+        // uses blanket mocking for the rest of the suite because the majority of
+        // tests care about policy behavior, not the auth bootstrap path; this is
+        // the documented exception for the suite, not an accidental omission.
+        // A dedicated test can choose explicit `set_auths` entries to verify the
+        // real `require_auth` flow when admin/agent semantics matter.
         env.mock_all_auths();
         let client = PolicyEngineClient::new(&env, &guard);
         let pk = agent.verifying_key().to_bytes();
@@ -545,6 +547,50 @@ impl Harness {
             guard_nonce: 1,
             admin_nonce: 1,
         }
+    }
+
+    /// Fresh registration under real host auth: initialize and the first policy
+    /// set both require explicit admin entries, with no blanket `mock_all_auths`
+    /// call in this harness.
+    fn new_enforced_auth() -> Self {
+        let env = Env::default();
+        let agent = SigningKey::from_bytes(&[7u8; 32]);
+        let admin = env.register(MockAdmin, ());
+        let asset = env.register(MockAsset, ());
+        let guard = env.register(PolicyEngine, ());
+        let recv = Address::generate(&env);
+        let other = Address::generate(&env);
+
+        let mut h = Harness {
+            env,
+            guard,
+            admin,
+            asset,
+            agent,
+            recv,
+            other,
+            guard_nonce: 1,
+            admin_nonce: 1,
+        };
+
+        let pk = h.agent.verifying_key().to_bytes();
+        let init_root = h.invocation(
+            &h.guard,
+            "initialize",
+            std::vec![
+                h.admin.clone().into_val(&h.env),
+                BytesN::from_array(&h.env, &pk).into_val(&h.env),
+            ],
+        );
+        let init_entry = {
+            let h = &mut h;
+            h.admin_entry(&init_root)
+        };
+        h.env.set_auths(&[init_entry]);
+        PolicyEngineClient::new(&h.env, &h.guard)
+            .initialize(&h.admin, &BytesN::from_array(&h.env, &pk));
+
+        h
     }
 
     /// Base policy: asset = `MockAsset`, one allowed recipient, no caps.
@@ -1167,6 +1213,91 @@ impl Harness {
             )
         })
     }
+}
+
+// ── Full lifecycle under real host auth (issue #438) ──────────────────────
+//
+// The rest of this suite mocks auth on purpose (see the harness header):
+// most tests care about policy *behaviour*, not about how the account is
+// authorized, and hand-signing every admin call would bury that intent.
+//
+// The blanket mock hides a whole class of regressions, though: a
+// `require_auth` that no longer matches the recorded admin, an auth entry
+// built against the wrong invocation tree, a signature over the wrong
+// payload. None of them can show up while `mock_all_auths()` short-circuits
+// every authorization.
+//
+// The test below closes that gap for the registration path. It runs the
+// whole lifecycle — `initialize`, `set_policy`, and an agent-signed
+// transfer — under *real* host auth, with explicit `set_auths` entries and
+// no `mock_all_auths()` call anywhere in the flow.
+
+/// A fresh registration must be usable end to end under real host auth: the
+/// admin authorizes `initialize` and `set_policy`, the agent authorizes a
+/// guarded transfer, and the installed policy decides it.
+#[test]
+fn full_lifecycle_runs_under_real_host_auth() {
+    // 1. Registration under a real admin auth entry.
+    let mut h = Harness::new_enforced_auth();
+    let (admin, pending) = h.stored_admins();
+    assert_eq!(
+        admin,
+        Some(h.admin.clone()),
+        "initialize must store the admin that authorized it"
+    );
+    assert_eq!(
+        pending, None,
+        "no admin rotation is pending after initialize"
+    );
+    assert!(
+        !h.status().has_policy,
+        "a fresh registration has no policy yet"
+    );
+
+    // 2. Policy install under a real admin auth entry.
+    let mut p = h.base_policy();
+    p.per_tx_cap = 50;
+    h.set_policy_enforcing(&p);
+    let status = h.status();
+    assert!(status.has_policy, "set_policy must install the policy");
+    assert_eq!(
+        status.policy_revision, 1,
+        "the first policy install is revision 1"
+    );
+
+    // 3. An agent-signed transfer under the installed policy is allowed.
+    let recv = h.recv.clone();
+    h.transfer(&recv, 20);
+    assert!(
+        h.emitted_allowed_auth(),
+        "the guarded transfer must be decided by the policy, not mocked away"
+    );
+
+    // 4. The same policy blocks an over-cap transfer in the same lifecycle.
+    let reason = h.transfer_blocked_reason(&recv, 51);
+    assert!(
+        reason.contains("per_tx_cap_exceeded"),
+        "an over-cap transfer must be blocked with the cap reason, got {reason}"
+    );
+
+    // 5. The admin authorization is enforced, not merely present: an entry
+    //    belonging to a different account must not be able to set a policy.
+    let impostor = h.env.register(MockAdmin, ());
+    let root = h.set_policy_invocation(&p);
+    let entry = h.non_admin_entry(&impostor, &root);
+    h.enforce(entry);
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PolicyEngineClient::new(&h.env, &h.guard).set_policy(&p);
+    }));
+    assert!(
+        res.is_err(),
+        "a non-admin entry must not be able to install a policy"
+    );
+    assert_eq!(
+        h.status().policy_revision,
+        1,
+        "the rejected install must leave the installed policy untouched"
+    );
 }
 
 // ── GuardScenario: declarative scenario builder (issue #63) ──────────────
