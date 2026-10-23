@@ -1402,10 +1402,16 @@ fn run(call: &Call, args: &Args) -> RunOutcome {
 
     // Add bump and final-fee to the machine-readable report so callers can
     // surface the GUARD_KEY_FEE_BUMP contribution explicitly.
-    report.as_object_mut().unwrap().insert("bump".to_string(), serde_json::json!(GUARD_KEY_FEE_BUMP));
-    report.as_object_mut().unwrap().insert("final_fee".to_string(), serde_json::json!(fee));
+    report
+        .as_object_mut()
+        .unwrap()
+        .insert("bump".to_string(), serde_json::json!(GUARD_KEY_FEE_BUMP));
+    report
+        .as_object_mut()
+        .unwrap()
+        .insert("final_fee".to_string(), serde_json::json!(fee));
     // Print compact JSON on its own line for machine consumption.
-    println!("MACHINE_OUTPUT: {}", report.to_string());
+    println!("MACHINE_OUTPUT: {report}");
     let tx = Transaction {
         source_account: MuxedAccount::Ed25519(Uint256(source_pk)),
         fee,
